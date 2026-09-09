@@ -52,8 +52,8 @@ jobs:
         shell: bash
         run: |
           pyinstaller --onefile --clean --name pamt \
-            --add-data "pamt/assets:pamt/assets" \
-            pamt/app.py
+            --collect-all pamt \
+            launcher.py
           mv dist/pamt "dist/pamt-${{ matrix.suffix }}"
 
       - name: Build binary (Windows)
@@ -61,8 +61,8 @@ jobs:
         shell: bash
         run: |
           pyinstaller --onefile --clean --name pamt \
-            --add-data "pamt/assets;pamt/assets" \
-            pamt/app.py
+            --collect-all pamt \
+            launcher.py
           mv dist/pamt.exe "dist/pamt-${{ matrix.suffix }}.exe"
 
       - name: Build binary (macOS)
@@ -70,8 +70,8 @@ jobs:
         shell: bash
         run: |
           pyinstaller --onefile --clean --name pamt \
-            --add-data "pamt/assets:pamt/assets" \
-            pamt/app.py
+            --collect-all pamt \
+            launcher.py
           mv dist/pamt "dist/pamt-${{ matrix.suffix }}"
 
       - name: Upload artifact
