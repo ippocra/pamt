@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install pyaudio pystray pillow pynput pyinstaller
+          pip install pyaudio pystray pillow pynput platformdirs pyinstaller
 
       - name: Build binary (Linux)
         if: runner.os == 'Linux'

@@ -6,10 +6,16 @@ Two independent tracks are recorded concurrently:
 * **system**   -- what the meeting plays through the machine (the *other*
   people, plus any local notification sounds).
 
-Each track is written as a 16-bit mono WAV at the device's *native* sample
-rate. Different devices support different rates (WASAPI on Windows is
+Each track is **captured at 24-bit** (when the device allows it) for the best
+possible signal-to-noise and headroom, then written as a **16-bit mono WAV**
+at the device's *native* sample rate. 24-bit capture is the source-level fix
+for two common problems: laptop mics record very quietly (24-bit gives ~18 dB
+more headroom to amplify them *without* clipping), and low-quality loopback
+capture carries a harsh high-frequency tail (more bits = lower noise floor).
+The files stay 16-bit because Whisper wants 16-bit, so nothing downstream
+changes. Different devices support different rates (WASAPI on Windows is
 especially picky), so we open each stream at the rate the device actually
-accepts rather than forcing one global rate. Whisper resamples at
+accepts rather than forcing one global rate; Whisper resamples at
 transcription time, so the per-track rates need not match.
 
 Device hints:
@@ -33,12 +39,29 @@ import pyaudio
 log = logging.getLogger(__name__)
 
 CHANNELS = 1
-SAMPLE_WIDTH = 2  # 16-bit
+CAPTURE_WIDTH = 3   # 24-bit capture (best SNR / headroom); falls back to 16
+OUTPUT_WIDTH = 2    # 16-bit WAV output (Whisper-compatible)
+CAPTURE_FORMATS = (pyaudio.paInt24, pyaudio.paInt16)  # try 24-bit first
 CHUNK = 1024
 # Fallback sample rate only if a device advertises nothing usable.
 DEFAULT_RATE = 44_100
 # Rates to try (most common first) when we can't open at the native rate.
 _FALLBACK_RATES = (48_000, 44_100, 16_000)
+
+# Auto-gain for the *mic* track: laptop mics record very quietly (~ -40 dB
+# RMS). We lift it toward a normal speech level (target ~ -18 dB) so
+# transcription has something to work with. Because we capture at 24-bit the
+# boost has real headroom and won't clip. Values are in dB.
+GAIN_TARGET_DB = -18.0       # aim the mic's average level here
+GAIN_THRESHOLD_DB = -30.0    # only boost tracks quieter than this
+GAIN_CAP_DB = 48.0           # never boost more than this (24-bit headroom)
+GAIN_FLOOR_DB = 0.0          # never attenuate a loud track
+
+# Low-pass the *system* track: loopback capture of compressed web audio often
+# carries a harsh high-frequency tail (aliasing/harshness above ~4-8 kHz) that
+# sounds "fuzzy". Whisper band-limits to 8 kHz anyway, so cutting the HF tail
+# cleans the track and removes the fuzz. `state` carries continuity.
+LOWPASS_HZ = 8_000
 
 # Keywords that identify a system-output (loopback) capture device.
 _SYSTEM_HINTS = (
@@ -73,6 +96,8 @@ class Track:
     device_name: str
     out_path: Path
     rate: int = DEFAULT_RATE
+    capture_width: int = CAPTURE_WIDTH   # bits/3 -> bytes per sample at capture
+    format = pyaudio.paInt24             # PyAudio format actually used
 
 
 def list_input_devices() -> list[tuple[int, str]]:
@@ -121,6 +146,117 @@ def _rms(data: bytes) -> float:
     return min(1.0, ((sum(s * s for s in samples) / n) ** 0.5) / 8000.0)
 
 
+def _apply_gain_16(data: bytes, gain_db: float) -> bytes:
+    """Multiply 16-bit PCM by a gain (dB), clamping to prevent clipping."""
+    if gain_db <= 0:
+        return data
+    factor = 10.0 ** (gain_db / 20.0)
+    n = len(data) // 2
+    samples = struct.unpack(f"<{n}h", data[: n * 2])
+    out = [max(-32768, min(32767, int(round(s * factor)))) for s in samples]
+    return struct.pack(f"<{n}h", *out)
+
+
+def _lowpass_16(data: bytes, rate: int, cutoff_hz: float,
+                state: list[float]) -> bytes:
+    """2-pole low-pass (steeper roll-off) for the system track.
+
+    Removes the harsh high-frequency tail (aliasing/harshness). `state` holds
+    the two previous filter outputs so the filter is continuous across chunks.
+    """
+    if cutoff_hz <= 0:
+        return data
+    r = 2.0 * 3.141592653589793 * cutoff_hz / rate
+    alpha = r / (1.0 + r)
+    n = len(data) // 2
+    samples = struct.unpack(f"<{n}h", data[: n * 2])
+    s0 = state[0] if len(state) > 0 else 0.0
+    s1 = state[1] if len(state) > 1 else 0.0
+    out = []
+    for s in samples:
+        s0 = s0 + alpha * (s - s0)
+        s1 = s1 + alpha * (s0 - s1)
+        out.append(int(round(max(-32768, min(32767, s1)))))
+    state[0], state[1] = s0, s1
+    return struct.pack(f"<{n}h", *out)
+
+
+# -- 24-bit helpers -------------------------------------------------------
+
+def _unpack_24(data: bytes) -> list[int]:
+    """Decode little-endian 24-bit PCM into signed ints (range ~+-8.4M)."""
+    n = len(data) // 3
+    out = []
+    for i in range(n):
+        b0 = data[i * 3]
+        b1 = data[i * 3 + 1]
+        b2 = data[i * 3 + 2]
+        v = b0 | (b1 << 8) | (b2 << 16)
+        if v >= 0x800000:
+            v -= 0x1000000
+        out.append(v)
+    return out
+
+
+def _pack_24(samples: list[int]) -> bytes:
+    """Encode signed ints back to little-endian 24-bit PCM."""
+    out = bytearray()
+    for v in samples:
+        v &= 0xFFFFFF
+        out += bytes((v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF))
+    return bytes(out)
+
+
+def _rms_24(data: bytes) -> float:
+    """RMS of 24-bit PCM, scaled to ~0..1."""
+    samples = _unpack_24(data)
+    n = len(samples)
+    if n == 0:
+        return 0.0
+    return min(1.0, ((sum(s * s for s in samples) / n) ** 0.5) / 8_388_608.0)
+
+
+def _apply_gain_24(data: bytes, gain_db: float) -> bytes:
+    """Multiply 24-bit PCM by a gain (dB), clamped to the 24-bit range."""
+    if gain_db <= 0:
+        return data
+    factor = 10.0 ** (gain_db / 20.0)
+    samples = _unpack_24(data)
+    return _pack_24([max(-8_388_608, min(8_388_607, int(round(s * factor))))
+                     for s in samples])
+
+
+def _lowpass_24(data: bytes, rate: int, cutoff_hz: float,
+                state: list[float]) -> bytes:
+    """2-pole low-pass on 24-bit PCM (continuous across chunks via `state`)."""
+    if cutoff_hz <= 0:
+        return data
+    r = 2.0 * 3.141592653589793 * cutoff_hz / rate
+    alpha = r / (1.0 + r)
+    samples = _unpack_24(data)
+    s0 = state[0] if len(state) > 0 else 0.0
+    s1 = state[1] if len(state) > 1 else 0.0
+    out = []
+    for s in samples:
+        s0 = s0 + alpha * (s - s0)
+        s1 = s1 + alpha * (s0 - s1)
+        out.append(int(round(max(-8_388_608, min(8_388_607, s1)))))
+    state[0], state[1] = s0, s1
+    return _pack_24(out)
+
+
+def _downmix_24_to_16(data: bytes) -> bytes:
+    """Convert 24-bit PCM to 16-bit PCM (shift right 8, clip)."""
+    samples = _unpack_24(data)
+    return struct.pack(f"<{len(samples)}h",
+                       *[max(-32768, min(32767, s >> 8)) for s in samples])
+
+
+def _downmix_16_to_16(data: bytes) -> bytes:
+    """16-bit passthrough (already 16-bit)."""
+    return data
+
+
 class _WavWriter(threading.Thread):
     """Drains a queue of PCM frames into a WAV file at the track's rate."""
 
@@ -143,7 +279,7 @@ class _WavWriter(threading.Thread):
         self.track.out_path.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(self.track.out_path), "wb") as wf:
             wf.setnchannels(CHANNELS)
-            wf.setsampwidth(SAMPLE_WIDTH)
+            wf.setsampwidth(OUTPUT_WIDTH)   # always write 16-bit WAV
             wf.setframerate(self.track.rate)
             while True:
                 with self._lock:
@@ -178,32 +314,38 @@ class Recorder:
     # -- lifecycle -------------------------------------------------------
 
     def _open_stream(self, track: Track) -> pyaudio.Stream:
-        """Open an input stream for *track* at a rate the device accepts."""
+        """Open an input stream for *track*.
+
+        Tries 24-bit first (best SNR/headroom), then 16-bit, at the device's
+        native rate and then common fallbacks. The first combination that
+        opens wins, and we record the rate + format actually used.
+        """
         pa = self._pa
         assert pa is not None
         info = pa.get_device_info_by_index(track.device_index)
         native = int(info.get("defaultSampleRate", 0) or 0)
-        # Try the native rate first (skip it if it's 0/invalid), then fall
-        # back to common rates. First one that opens wins.
         rates: list[int] = []
         if native and 3_000 < native < 200_000:
             rates.append(native)
         rates.extend(r for r in _FALLBACK_RATES if r not in rates)
         last_err: Exception | None = None
-        for rate in rates:
-            try:
-                stream = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=CHANNELS,
-                    rate=rate,
-                    input=True,
-                    input_device_index=track.device_index,
-                    frames_per_buffer=CHUNK,
-                )
-                track.rate = rate
-                return stream
-            except Exception as e:
-                last_err = e
+        for fmt in CAPTURE_FORMATS:          # 24-bit first, then 16-bit
+            for rate in rates:
+                try:
+                    stream = pa.open(
+                        format=fmt,
+                        channels=CHANNELS,
+                        rate=rate,
+                        input=True,
+                        input_device_index=track.device_index,
+                        frames_per_buffer=CHUNK,
+                    )
+                    track.rate = rate
+                    track.format = fmt
+                    track.capture_width = 3 if fmt == pyaudio.paInt24 else 2
+                    return stream
+                except Exception as e:
+                    last_err = e
         raise RuntimeError(
             f"could not open '{track.device_name}' at any sample rate: {last_err}"
         )
@@ -271,8 +413,10 @@ class Recorder:
         self._writers.append(writer)
         self._pumps.append(pump)
         self._last_paths.append(track.out_path)
-        log.info("recording %s: %s (%d Hz) -> %s",
-                 track.kind, track.device_name, track.rate, track.out_path)
+        bits = 24 if track.format == pyaudio.paInt24 else 16
+        log.info("recording %s: %s (%d Hz, %d-bit) -> %s",
+                 track.kind, track.device_name, track.rate, bits,
+                 track.out_path)
 
     def stop(self) -> list[Path]:
         if not self._recording:
@@ -307,15 +451,51 @@ class Recorder:
     # -- internals -------------------------------------------------------
 
     def _pump(self, stream: pyaudio.Stream, writer: _WavWriter) -> None:
+        kind = writer.track.kind
+        fmt = writer.track.format
+        is24 = (fmt == pyaudio.paInt24)
+        apply_gain = kind == "mic"
+        apply_lp = kind == "system"
+        avg: list[float] = []           # recent RMS (linear) for stable mic gain
+        lp_state: list[float] = [0.0, 0.0]   # 2-pole low-pass continuity state
+        rms_fn = _rms_24 if is24 else _rms
+        gain_fn = _apply_gain_24 if is24 else _apply_gain_16
+        lp_fn = (_lowpass_24 if is24 else _lowpass_16)
+        downmix = _downmix_24_to_16 if is24 else _downmix_16_to_16
         while self._recording:
             try:
                 data = stream.read(CHUNK, exception_on_overflow=False)
             except Exception:
-                log.exception("read error on %s", writer.track.kind)
+                log.exception("read error on %s", kind)
                 time.sleep(0.01)
                 continue
-            self._levels[writer.track.kind] = _rms(data)
-            writer.push(data)
+            rms = rms_fn(data)
+            self._levels[kind] = rms
+            if apply_gain:
+                data = self._gained(data, rms, avg, gain_fn)
+            if apply_lp:
+                data = lp_fn(data, writer.track.rate, LOWPASS_HZ, lp_state)
+            writer.push(downmix(data))   # writer always expects 16-bit
+
+    def _gained(self, data: bytes, rms: float, avg: list[float],
+                gain_fn) -> bytes:
+        """Amplify quiet mic audio toward a usable level (see GAIN_TARGET_DB).
+
+        Uses a short moving average of RMS so the gain is steady rather than
+        "pumping" with the speech envelope. Loud input (above the threshold)
+        passes through untouched; we never attenuate.
+        """
+        avg.append(rms)
+        if len(avg) > 8:
+            avg.pop(0)
+        recent = sum(avg) / len(avg)
+        if recent <= 0.0005:            # effectively silent -> no useful level
+            return data
+        recent_db = 20.0 * (recent ** 0.5) - 20.0  # approx dBFS from 0..1 RMS
+        if recent_db >= GAIN_THRESHOLD_DB:
+            return data
+        gain = min(GAIN_CAP_DB, max(GAIN_FLOOR_DB, GAIN_TARGET_DB - recent_db))
+        return gain_fn(data, gain)
 
     # -- introspection ---------------------------------------------------
 

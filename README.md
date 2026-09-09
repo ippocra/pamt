@@ -24,8 +24,19 @@ PAmt lets the transcription step label speakers correctly ("me" vs.
   is on screen.
 - **Global hotkey** — `Ctrl+Alt+R` toggles recording (start/stop) from
   anywhere, even with the meeting window focused.
-- **Dual-track capture** — writes `~/.pamt/YYYY-MM-DD_HHMM/mic.wav` and
-  `~/.pamt/YYYY-MM-DD_HHMM/system.wav`.
+- **Dual-track capture** — writes `mic.wav` and `system.wav` into a
+  timestamped folder per meeting, in your OS's standard user-data
+  location (see *Where recordings are saved*). Captured at **24-bit** for
+  the best signal-to-noise, written as 16-bit WAV (transcription-ready).
+- **Find your recordings from the tray** — open the latest recording, its
+  mic/system tracks, or the whole recordings folder without leaving the
+  tray menu.
+- **Choose your devices** — right-click → **⚙ Choose audio devices** to
+  pick exactly which mic and which system-audio (loopback) device to use,
+  instead of relying on auto-detection.
+- **Auto-gain + de-fuzz** — the mic track is automatically amplified to a
+  usable speech level (no clipping, thanks to 24-bit headroom), and the
+  system track's harsh high-frequency tail is filtered out at the source.
 - **Live level meter** — the tray tooltip shows a running timer and per-
   track audio levels while recording.
 - **Graceful degradation** — if the system-audio (loopback) device is
@@ -61,11 +72,35 @@ or right-click the tray icon. If the exe exits immediately, run
 1. Launch PAmt — the mic icon appears in your system tray (look in the
    overflow area, `^`, if you don't see it).
 2. Join your meeting.
-3. Press **`Ctrl+Alt+R`** (or right-click the tray → *Record meeting*).
-   The icon turns red with a red dot and a live timer.
-4. When the call ends, press **`Ctrl+Alt+R`** again (or *Stop*).
-5. Your two WAV files are in `~/.pamt/` (or `C:\Users\<you>\.pamt\` on
-   Windows).
+3. **Start / stop** — either:
+   - right-click the tray icon → **⏺ Start recording** (the label flips to
+     **⏹ Stop recording** with a live timer while recording), or
+   - press the global hotkey **`Ctrl+Alt+R`** from anywhere.
+
+   The tray icon turns red with a live `MM:SS` timer and per-track level
+   meter while recording.
+4. When the call ends, stop the same way. A dialog lists the exact file
+   paths that were saved.
+5. **Find your recordings** from the tray menu:
+   - **Open latest recording** — opens the most recent meeting's folder.
+   - **↳ mic track** / **↳ system track** — opens that track's WAV directly
+     in your default audio player.
+   - **Open recordings folder** — opens the folder containing *all* meetings.
+
+## Where recordings are saved
+
+PAmt uses each OS's standard user-data location (via `platformdirs`):
+
+| OS      | Path |
+|---------|------|
+| Windows | `C:\Users\<you>\AppData\Local\PAmt\meetings` |
+| macOS   | `~/Library/Application Support/PAmt/meetings` |
+| Linux   | `~/.local/share/PAmt/meetings` (respects `XDG_DATA_HOME`) |
+
+Each meeting is its own timestamped folder (`YYYY-MM-DD_HHMM`) holding
+`mic.wav` and `system.wav`. You don't need to navigate there manually —
+the tray menu's "Open latest recording" / "Open recordings folder" items
+take you straight there.
 
 ## System-audio (loopback) setup
 
@@ -85,13 +120,35 @@ loopback capture device on each OS:
 If the system track can't be opened, PAmt records the mic only and tells
 you what to enable.
 
-## Sample rates
+## Sample rates & bit depth
 
-Each track is recorded at the **device's native sample rate** (16-bit
-mono). WASAPI on Windows is picky about rates, so PAmt opens each device
-at the rate it actually accepts rather than forcing one global rate. The
-two tracks can end up at different rates (e.g. 44.1 kHz mic, 48 kHz
-system) — that's fine, the transcription step resamples as needed.
+Each track is **captured at 24-bit** (falling back to 16-bit if a device
+can't open 24-bit) and written as a **16-bit mono WAV**. Capturing at
+24-bit is the source-level quality fix: it gives ~18 dB more headroom, so
+quiet laptop mics can be amplified *without* clipping and the noise floor
+drops. The files stay 16-bit because the transcription engine (whisper.cpp)
+wants 16-bit, so nothing downstream changes.
+
+Each track is recorded at the **device's native sample rate**. WASAPI on
+Windows is picky about rates, so PAmt opens each device at the rate it
+actually accepts rather than forcing one global rate. The two tracks can
+end up at different rates (e.g. 44.1 kHz mic, 48 kHz system) — that's fine,
+the transcription step resamples as needed.
+
+## Choosing the best devices
+
+PAmt auto-detects a mic and a system-audio (loopback) device, but the
+auto-pick can land on a weak default (e.g. Windows' generic
+"Microsoft Sound Mapper"). If a track sounds bad, right-click the tray icon
+→ **⚙ Choose audio devices** and pick explicitly:
+
+- **Microphone** — choose your actual mic/headset, not a generic mapper.
+- **System audio** — choose the best loopback source. For the clearest
+  meeting capture on Windows, install
+  [VB-Cable](https://vb-audio.com/Cable/), set your meeting output to play
+  through the VB-Cable, then select it here. VB-Cable captures exactly what
+  plays in the browser at full fidelity — this is the single biggest
+  quality win for the system track.
 
 ## From WAV to transcript
 
@@ -113,7 +170,8 @@ pamt            # launch the tray app
 ## Privacy
 
 - 100% local. PAmt never phones home.
-- Audio is written only to your disk, under `~/.pamt/`.
+- Audio is written only to your disk, in your OS's standard user-data
+  location (see *Where recordings are saved*).
 - No network access at all.
 
 ## Roadmap

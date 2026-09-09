@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import platform
+import re
 import sys
 import threading
 import time
@@ -19,13 +20,28 @@ from .audio import Recorder
 
 log = logging.getLogger(__name__)
 
-MEETINGS_DIR = Path.home() / "meetings"
+# Per-OS user-data location, via the platformdirs standard:
+#   Windows -> %LOCALAPPDATA%\PAmt\meetings  (C:\Users\<you>\AppData\Local\PAmt)
+#   macOS   -> ~/Library/Application Support/PAmt/meetings
+#   Linux   -> ~/.local/share/PAmt/meetings   (respects XDG_DATA_HOME)
+try:
+    from platformdirs import user_data_dir
+    _DATA_ROOT = Path(user_data_dir("PAmt"))
+except Exception:  # pragma: no cover - platformdirs should always be present
+    _DATA_ROOT = Path.home() / ".pamt"
+MEETINGS_DIR = _DATA_ROOT / "meetings"
 _ASSETS = Path(__file__).resolve().parent / "assets"
 _ICON_SRC = _ASSETS / "icon_64.png"
 
 # Global hotkey: Ctrl+Alt+R  (start/stop)
 HOTKEY_MODS = ("ctrl", "alt")
 HOTKEY_KEY = "r"
+
+APP_NAME = "PAmt"
+GITHUB_URL = "https://github.com/ippocra/pamt"
+
+# Recording folders look like 2026-09-09_1835  (YYYY-MM-DD_HHMM).
+_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{4}$")
 
 _LOGO: Image.Image | None = None  # lazy-cached logo
 
@@ -75,8 +91,30 @@ def _fmt(s: float) -> str:
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
+def _show_message(title: str, msg: str) -> None:
+    """Show a (non-blocking) message box, on any OS, with a console fallback."""
+    log.info("%s: %s", title, msg)
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, msg, title, 0x40)  # MB_ICONINFORMATION
+        elif sys.platform == "darwin":
+            import subprocess
+            esc = msg.replace('"', '\\"')
+            subprocess.Popen(["osascript", "-e",
+                              f'display dialog "{esc}" with title "{title}"'])
+        else:
+            import subprocess
+            subprocess.Popen(
+                ["zenity", "--info", f"--title={title}", f"--text={msg}"],
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        print(f"\n{title}:\n{msg}\n", file=sys.stderr, flush=True)
+
+
 def _show_error(msg: str) -> None:
-    """Show a blocking message box, on any OS, with a console fallback."""
+    """Show a blocking error box, on any OS, with a console fallback."""
     log.error(msg)
     try:
         if sys.platform == "win32":
@@ -93,8 +131,20 @@ def _show_error(msg: str) -> None:
                 stderr=subprocess.DEVNULL,
             )
     except Exception:
-        # Last resort: write to stderr so it's visible in a terminal.
         print(f"\nPAmt error:\n{msg}\n", file=sys.stderr, flush=True)
+
+
+def _recording_dirs(base: Path) -> list[Path]:
+    """Timestamped recording subfolders, newest first."""
+    if not base.is_dir():
+        return []
+    dirs = [d for d in base.iterdir()
+            if d.is_dir() and _TS_RE.match(d.name)]
+    return sorted(dirs, key=lambda d: d.name, reverse=True)
+
+
+def _latest_recording(base: Path) -> Path | None:
+    return _recording_dirs(base)[0] if _recording_dirs(base) else None
 
 
 class PamtApp:
@@ -102,6 +152,11 @@ class PamtApp:
         self.recorder = Recorder(MEETINGS_DIR)
         self._icon = None
         self._stop_evt = threading.Event()
+        self._mic_choice: tuple[int, str] | None = None      # user-picked mic
+        self._system_choice: tuple[int, str] | None = None   # user-picked system
+        # Menu items whose text we update as state changes.
+        self._record_item = None
+        self._latest_item = None
 
     # -- actions ---------------------------------------------------------
 
@@ -112,24 +167,145 @@ class PamtApp:
             self.start_recording()
 
     def start_recording(self) -> None:
+        if self.recorder.recording:
+            return
         try:
-            self.recorder.start()
+            self.recorder.start(
+                mic_device=self._mic_choice,
+                system_device=self._system_choice,
+            )
             log.info("recording started -> %s", self.recorder.output_paths())
+            self._refresh_state()
         except Exception as e:
             log.exception("start failed")
             _show_error(f"Could not start recording:\n{e}")
 
     def stop_recording(self) -> None:
+        if not self.recorder.recording:
+            return
         paths = self.recorder.stop()
         log.info("recording stopped: %s", paths)
-        _show_error(
-            "Saved:\n" + "\n".join(str(p) for p in paths) if paths
-            else "Stopped (no files written)"
+        self._refresh_state()
+        _show_message(
+            "PAmt — recording saved",
+            "\n".join(str(p) for p in paths) if paths
+            else "Stopped (no files written).",
         )
 
-    def open_folder(self) -> None:
+    def open_recordings_folder(self) -> None:
         MEETINGS_DIR.mkdir(parents=True, exist_ok=True)
         self._open_path(MEETINGS_DIR)
+
+    def open_latest_recording(self) -> None:
+        latest = _latest_recording(MEETINGS_DIR)
+        if latest is None:
+            _show_message("PAmt", f"No recordings yet.\nRecordings save to:\n{MEETINGS_DIR}")
+            return
+        self._open_path(latest)
+
+    def open_latest_mic(self) -> None:
+        self._open_latest_file("mic")
+
+    def open_latest_system(self) -> None:
+        self._open_latest_file("system")
+
+    def _open_latest_file(self, kind: str) -> None:
+        latest = _latest_recording(MEETINGS_DIR)
+        if latest is None:
+            _show_message("PAmt", "No recordings yet.")
+            return
+        f = latest / f"{latest.name}_{kind}.wav"
+        if not f.exists():
+            _show_message("PAmt", f"No '{kind}' track in the latest recording.\n{latest.name}")
+            return
+        self._open_path(f)
+
+    def choose_devices(self) -> None:
+        """Open a dialog to explicitly pick the mic and system-audio devices.
+
+        Lets you override the auto-detected devices -- useful when the app
+        picks a weak default (e.g. "Microsoft Sound Mapper") and you want a
+        better mic or a specific Stereo Mix / VB-Cable loopback device.
+        """
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+            from .audio import list_input_devices
+        except Exception as e:
+            _show_error(f"Device picker unavailable (no tkinter?):\n{e}")
+            return
+        devices = list_input_devices()
+        if not devices:
+            _show_error("No audio input devices found.")
+            return
+
+        root = tk.Tk()
+        root.title(f"{APP_NAME} — Choose audio devices")
+        root.resizable(False, False)
+
+        def _label(txt: str) -> None:
+            ttk.Label(root, text=txt, font=("Segoe UI", 10, "bold")).grid(
+                row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
+
+        _label("Microphone (what I say)")
+        mic_var = tk.StringVar(value=self._mic_choice[1] if self._mic_choice else "")
+        mic_box = ttk.Combobox(root, textvariable=mic_var, width=46,
+                               values=[n for _, n in devices])
+        mic_box.grid(row=1, column=0, columnspan=2, padx=10, pady=2)
+
+        ttk.Label(root, text="System audio (the meeting)",
+                  font=("Segoe UI", 10, "bold")).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=10, pady=(12, 2))
+        sys_var = tk.StringVar(value=self._system_choice[1] if self._system_choice else "")
+        sys_box = ttk.Combobox(root, textvariable=sys_var, width=46,
+                               values=["(none — mic only)"] + [n for _, n in devices])
+        sys_box.grid(row=3, column=0, columnspan=2, padx=10, pady=2)
+
+        ttk.Label(root, text="Tip: for the clearest system audio on Windows, "
+                             "install VB-Cable and select it above. "
+                             "Route your meeting output to the VB-Cable.",
+                  foreground="#666", wraplength=330).grid(
+            row=4, column=0, columnspan=2, padx=10, pady=4)
+
+        def _save() -> None:
+            def _pick(devs: list[tuple[int, str]], val: str) -> tuple[int, str] | None:
+                val = val.strip()
+                for i, n in devs:
+                    if n == val:
+                        return (i, n)
+                return None
+            self._mic_choice = _pick(devices, mic_var.get()) or (devices[0][0], devices[0][1])
+            sv = sys_var.get().strip()
+            self._system_choice = _pick(devices, sv) if sv and sv != "(none — mic only)" else None
+            root.destroy()
+            _show_message(
+                f"{APP_NAME} — devices",
+                f"Microphone: {self._mic_choice[1] if self._mic_choice else '(auto)'}\n"
+                f"System: {self._system_choice[1] if self._system_choice else '(auto/none)'}",
+            )
+
+        btns = ttk.Frame(root); btns.grid(row=5, column=0, columnspan=2, pady=10)
+        ttk.Button(btns, text="Save", command=_save).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=root.destroy).pack(side="left", padx=6)
+        root.mainloop()
+
+    def about(self) -> None:
+        """Show the About box (name, version, repo link) and open the repo."""
+        self._show_about()
+
+    def _show_about(self) -> None:
+        text = (
+            f"{APP_NAME}  v{__version__}\n"
+            "Private Annotator Meeting Transcriber\n\n"
+            f"Source: {GITHUB_URL}\n"
+        )
+        _show_message(f"{APP_NAME} — About", text)
+        # Also open the repo in the default browser (best-effort).
+        try:
+            import webbrowser
+            webbrowser.open(GITHUB_URL)
+        except Exception:
+            log.exception("could not open browser")
 
     def quit(self) -> None:
         if self.recorder.recording:
@@ -160,6 +336,27 @@ class PamtApp:
                 except FileNotFoundError:
                     continue
 
+    def _refresh_state(self) -> None:
+        """Update the live menu labels after a state change (best-effort)."""
+        try:
+            import pystray
+            if self._record_item is not None and self._icon is not None:
+                if self.recorder.recording:
+                    self._record_item.text = f"⏹ Stop recording  ({_fmt(self.recorder.duration)})"
+                else:
+                    self._record_item.text = "⏺ Start recording"
+                self._icon.update_menu()
+            self._refresh_latest_label()
+        except Exception:
+            log.exception("menu refresh failed")
+
+    def _refresh_latest_label(self) -> None:
+        if self._latest_item is None:
+            return
+        latest = _latest_recording(MEETINGS_DIR)
+        self._latest_item.text = (f"Open latest recording  ({latest.name})"
+                                  if latest else "Open latest recording  (none yet)")
+
     # -- UI loop ---------------------------------------------------------
 
     def run(self) -> None:
@@ -182,15 +379,30 @@ class PamtApp:
         except Exception as e:
             log.warning("hotkey not installed: %s", e)
 
+        record_item = pystray.MenuItem(
+            "⏺ Start recording", self.toggle, default=True,
+        )
+        latest_item = pystray.MenuItem("Open latest recording  (none yet)",
+                                       self.open_latest_recording)
+        self._record_item = record_item
+        self._latest_item = latest_item
+        self._refresh_latest_label()
+
         icon = pystray.Icon(
             "pamt",
             _icon_image(False, 0),
             "PAmt - idle (Ctrl+Alt+R to record)",
             pystray.Menu(
-                pystray.MenuItem("Record meeting", self.toggle, default=True),
-                pystray.MenuItem("Open meetings folder", self.open_folder),
+                record_item,
                 pystray.Menu.SEPARATOR,
-                pystray.MenuItem(f"PAmt v{__version__}", None, enabled=False),
+                latest_item,
+                pystray.MenuItem("  ↳ mic track", self.open_latest_mic),
+                pystray.MenuItem("  ↳ system track", self.open_latest_system),
+                pystray.MenuItem("Open recordings folder", self.open_recordings_folder),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("⚙ Choose audio devices…", self.choose_devices),
+                pystray.MenuItem("About PAmt", self.about),
+                pystray.MenuItem(f"v{__version__}  ·  hotkey Ctrl+Alt+R", None, enabled=False),
                 pystray.MenuItem("Quit", self.quit),
             ),
         )
@@ -225,8 +437,13 @@ class PamtApp:
                 lvl_sys = int(rec.level("system") * 10)
                 icon.title = (f"PAmt REC {_fmt(rec.duration)}  "
                               f"mic:{lvl_mic} sys:{lvl_sys}")
+                if self._record_item is not None:
+                    self._record_item.text = (
+                        f"⏹ Stop recording  ({_fmt(rec.duration)})")
             else:
                 icon.title = "PAmt - idle (Ctrl+Alt+R to record)"
+                if self._record_item is not None:
+                    self._record_item.text = "⏺ Start recording"
         except Exception:
             log.exception("tray refresh failed")
 
