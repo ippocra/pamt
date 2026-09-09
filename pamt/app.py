@@ -22,7 +22,7 @@ from .audio import Recorder
 log = logging.getLogger(__name__)
 
 MEETINGS_DIR = Path.home() / "meetings"
-_ASSETS = Path(__file__).resolve().parent.parent / "assets"
+_ASSETS = Path(__file__).resolve().parent / "assets"
 _ICON_SRC = _ASSETS / "icon_64.png"
 
 
