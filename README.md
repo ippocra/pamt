@@ -5,91 +5,126 @@
 </p>
 
 Records online meeting audio (Zoom, Teams, Zoho Meet, any browser-based
-call) as **two local WAV tracks** — so *you* can keep track of what was
-said and relisten to the call:
+call) as **two separate WAV tracks** — your microphone and the meeting's
+system audio — so the two can be transcribed independently and merged
+into a clean, speaker-labeled transcript.
 
-- `*_mic.wav` — your microphone (what you say)
-- `*_system.wav` — system audio (everyone else on the call)
+Everything runs **locally**. No cloud, no accounts, no telemetry.
 
-Everything is local. No cloud, no account, no audio ever leaves the
-machine. Two tracks means a later transcript can label "you" vs. "them"
-for free.
+## Why two tracks?
 
-> ## ⚠️ Recording etiquette / legal notice
->
-> PAmt records audio **on your own computer**. It is intended for personal
-> use: keeping track of what you said, relistening to a call, or building
-> your own notes.
->
-> **If you use it during a meeting with other people, you must make sure
-> the other participants know the conversation is being recorded.**
-> Recording a call without the knowledge and consent of all parties may be
-> illegal in your jurisdiction and is always a breach of trust. The
-> responsibility for compliant, courteous use is entirely yours.
+When you're on a video call, your mic and the people on the other end are
+mixed together in your headset. By recording them as two distinct files,
+PAmt lets the transcription step label speakers correctly ("me" vs.
+"them") instead of producing one undifferentiated blob of speech.
 
-## Status
+## What it does
 
-**Phase 1 (recording) — done.** System-tray app with a global hotkey.
-**Phase 2 (transcription) — planned.** CPU-friendly, model-agnostic
-(faster-whisper / whisper.cpp), run after the call.
+- **System-tray app** — a small mic icon lives in the tray; nothing else
+  is on screen.
+- **Global hotkey** — `Ctrl+Alt+R` toggles recording (start/stop) from
+  anywhere, even with the meeting window focused.
+- **Dual-track capture** — writes `~/.pamt/YYYY-MM-DD_HHMM/mic.wav` and
+  `~/.pamt/YYYY-MM-DD_HHMM/system.wav`.
+- **Live level meter** — the tray tooltip shows a running timer and per-
+  track audio levels while recording.
+- **Graceful degradation** — if the system-audio (loopback) device is
+  missing or broken, PAmt records the mic instead of failing, and tells
+  you what to fix.
 
-## Requirements
+## Getting the binary (no Python needed)
 
-- Python 3.10+
-- **PyAudio** (build deps per platform):
-  - **Ubuntu**: `sudo apt install portaudio19-dev` then `pip install pyaudio`
-  - **Windows 11**: `pip install pyaudio` (wheels ship prebuilt)
-- `pystray`, `Pillow`, `pynput` (installed from `pyproject.toml`)
+Pre-built, single-file binaries for Windows / Linux / macOS are published
+on every release:
 
-### System-audio capture device
+- 🪟 **Windows** → download `pamt-windows.exe`
+- 🐧 **Linux** → download `pamt-linux`, then `chmod +x pamt-linux`
+- 🍎 **macOS** → download `pamt-macos`, then `chmod +x pamt-macos` (and
+  right-click → Open the first time to allow it)
 
-PAmt records *system audio* (what the meeting plays) through a virtual
-loopback input. Which one exists depends on your OS:
+Grab the latest from the [Releases page](https://github.com/ippocra/pamt/releases).
 
-| OS      | What to use                                                        |
-|---------|--------------------------------------------------------------------|
-| Ubuntu  | A PulseAudio/PipeWire **Monitor** source (e.g. `alsa_output.pci-0000_00_1f.3.analog-stereo.monitor`). PAmt auto-detects names containing `monitor`. |
-| Win 11  | **Stereo Mix** (enable in Sound Settings → More sound options → Recording) **or** install [VB-Cable](https://vb-audio.com/Cable/) |
-| macOS   | Install [BlackHole](https://github.com/ExistentialAudio/BlackHole) |
+### Running the Windows exe
 
-If PAmt can't find one it will tell you exactly what to install.
+From PowerShell, in the folder where you saved the exe:
 
-## Install
+```powershell
+.\pamt-windows.exe
+```
+
+The mic icon appears in the system tray. Use `Ctrl+Alt+R` to start/stop,
+or right-click the tray icon. If the exe exits immediately, run
+`.\pamt-windows.exe -x` to see the output.
+
+## Using it
+
+1. Launch PAmt — the mic icon appears in your system tray (look in the
+   overflow area, `^`, if you don't see it).
+2. Join your meeting.
+3. Press **`Ctrl+Alt+R`** (or right-click the tray → *Record meeting*).
+   The icon turns red with a red dot and a live timer.
+4. When the call ends, press **`Ctrl+Alt+R`** again (or *Stop*).
+5. Your two WAV files are in `~/.pamt/` (or `C:\Users\<you>\.pamt\` on
+   Windows).
+
+## System-audio (loopback) setup
+
+The mic track works out of the box. The **system** track needs a
+loopback capture device on each OS:
+
+- **Windows** — enable **Stereo Mix** (Settings → System → Sound → More
+  sound settings → *Recording* tab → right-click → *Show Disabled
+  Devices* → enable *Stereo Mix*), or install
+  [VB-Cable](https://vb-audio.com/Cable/) and select it.
+- **Linux** — PAmt auto-detects a PulseAudio/PipeWire **Monitor** source.
+  If none is found, create one with `pactl load-module module-null-sink
+  monitor_source_name=PAmtLoopback`.
+- **macOS** — install [BlackHole](https://existentialaudio.com/blackhole/)
+  and select it as a system-input device.
+
+If the system track can't be opened, PAmt records the mic only and tells
+you what to enable.
+
+## Sample rates
+
+Each track is recorded at the **device's native sample rate** (16-bit
+mono). WASAPI on Windows is picky about rates, so PAmt opens each device
+at the rate it actually accepts rather than forcing one global rate. The
+two tracks can end up at different rates (e.g. 44.1 kHz mic, 48 kHz
+system) — that's fine, the transcription step resamples as needed.
+
+## From WAV to transcript
+
+This release focuses on **recording**. Transcription is the next phase:
+the two WAVs are designed to be fed to a local ASR engine (e.g.
+whisper.cpp) independently, then merged into a labeled transcript. That
+keeps PAmt light and dependency-free for now.
+
+## Build from source
+
+Requires Python 3.10+ and PortAudio (`libportaudio2` / `brew install
+portaudio`).
 
 ```bash
-git clone <this repo> && cd pamt
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
+pamt            # launch the tray app
 ```
 
-## Usage
+## Privacy
 
-1. `pamt` — starts the tray icon (grey mic = idle, red mic + timer = recording).
-2. Join your meeting in the browser.
-3. Press **Ctrl+Alt+R** (or right-click the tray icon → *Record meeting*).
-4. When the call ends, press **Ctrl+Alt+R** again.
-5. The WAVs land in `~/meetings/` — the message box shows the paths.
-
-The tray icon also shows a live level meter (`mic:3 sys:7`) while recording.
-
-## File layout
-
-```
-~/meetings/
-  2026-09-09_1435/
-    2026-09-09_1435_mic.wav
-    2026-09-09_1435_system.wav
-```
+- 100% local. PAmt never phones home.
+- Audio is written only to your disk, under `~/.pamt/`.
+- No network access at all.
 
 ## Roadmap
 
-- [x] Phase 1: dual-track recording, tray icon, hotkey, level meter
-- [ ] Phase 2: post-call transcription (faster-whisper, CPU/GPU optional),
-      merge tracks into a speaker-labeled transcript
-- [ ] Phase 3: feed transcript to ILAI for summarization / action items
-- [ ] Auto-name session from the focused meeting window title
-- [ ] Windows auto-start / service install helper
+- [x] Dual-track local recording (mic + system audio)
+- [x] System tray + global hotkey
+- [x] Cross-platform binaries via GitHub Actions
+- [ ] Local transcription (whisper.cpp) with speaker labels
+- [ ] Automatic transcript merge + export (Markdown / SRT)
+- [ ] Per-meeting folders + auto-naming
 
 ## License
 
-MIT — see `LICENSE`.
+MIT

@@ -6,8 +6,11 @@ Two independent tracks are recorded concurrently:
 * **system**   -- what the meeting plays through the machine (the *other*
   people, plus any local notification sounds).
 
-Each track is written as a 16 kHz 16-bit mono WAV so the two files can be
-transcribed independently and merged later with per-track speaker labels.
+Each track is written as a 16-bit mono WAV at the device's *native* sample
+rate. Different devices support different rates (WASAPI on Windows is
+especially picky), so we open each stream at the rate the device actually
+accepts rather than forcing one global rate. Whisper resamples at
+transcription time, so the per-track rates need not match.
 
 Device hints:
     Linux   -- system audio: a Pulse/PipeWire "Monitor" source
@@ -29,10 +32,13 @@ import pyaudio
 
 log = logging.getLogger(__name__)
 
-SAMPLE_RATE = 16_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2  # 16-bit
 CHUNK = 1024
+# Fallback sample rate only if a device advertises nothing usable.
+DEFAULT_RATE = 44_100
+# Rates to try (most common first) when we can't open at the native rate.
+_FALLBACK_RATES = (48_000, 44_100, 16_000)
 
 # Keywords that identify a system-output (loopback) capture device.
 _SYSTEM_HINTS = (
@@ -66,6 +72,7 @@ class Track:
     device_index: int
     device_name: str
     out_path: Path
+    rate: int = DEFAULT_RATE
 
 
 def list_input_devices() -> list[tuple[int, str]]:
@@ -115,28 +122,29 @@ def _rms(data: bytes) -> float:
 
 
 class _WavWriter(threading.Thread):
-    """Drains a queue of PCM frames into a WAV file."""
+    """Drains a queue of PCM frames into a WAV file at the track's rate."""
 
     def __init__(self, track: Track):
         super().__init__(daemon=True, name=f"wav-{track.kind}")
         self.track = track
         self._q: list[bytes] = []
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._finished = threading.Event()  # (not named _stop: that shadows Thread._stop)
 
     def push(self, data: bytes) -> None:
         with self._lock:
             self._q.append(data)
 
-    def stop(self) -> None:
-        self._stop.set()
+    def finish(self) -> None:
+        """Signal the writer to flush and exit."""
+        self._finished.set()
 
     def run(self) -> None:
         self.track.out_path.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(self.track.out_path), "wb") as wf:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(SAMPLE_WIDTH)
-            wf.setframerate(SAMPLE_RATE)
+            wf.setframerate(self.track.rate)
             while True:
                 with self._lock:
                     if self._q:
@@ -147,10 +155,10 @@ class _WavWriter(threading.Thread):
                 if frames:
                     wf.writeframes(frames)
                 else:
-                    if self._stop.is_set():
+                    if self._finished.is_set():
                         break
                     time.sleep(0.005)
-        log.info("wrote %s", self.track.out_path)
+        log.info("wrote %s (%d Hz)", self.track.out_path, self.track.rate)
 
 
 class Recorder:
@@ -169,6 +177,37 @@ class Recorder:
 
     # -- lifecycle -------------------------------------------------------
 
+    def _open_stream(self, track: Track) -> pyaudio.Stream:
+        """Open an input stream for *track* at a rate the device accepts."""
+        pa = self._pa
+        assert pa is not None
+        info = pa.get_device_info_by_index(track.device_index)
+        native = int(info.get("defaultSampleRate", 0) or 0)
+        # Try the native rate first (skip it if it's 0/invalid), then fall
+        # back to common rates. First one that opens wins.
+        rates: list[int] = []
+        if native and 3_000 < native < 200_000:
+            rates.append(native)
+        rates.extend(r for r in _FALLBACK_RATES if r not in rates)
+        last_err: Exception | None = None
+        for rate in rates:
+            try:
+                stream = pa.open(
+                    format=pyaudio.paInt16,
+                    channels=CHANNELS,
+                    rate=rate,
+                    input=True,
+                    input_device_index=track.device_index,
+                    frames_per_buffer=CHUNK,
+                )
+                track.rate = rate
+                return stream
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(
+            f"could not open '{track.device_name}' at any sample rate: {last_err}"
+        )
+
     def start(self,
               mic_device: tuple[int, str] | None = None,
               system_device: tuple[int, str] | None = None) -> list[Path]:
@@ -180,56 +219,72 @@ class Recorder:
         system = system_device or guessed_system
         if mic is None:
             raise RuntimeError("no microphone input device found")
-        if system is None:
-            raise RuntimeError(
-                "No system-audio capture device found. "
-                "Linux: pick a Pulse/PipeWire 'Monitor' source. "
-                "Windows: enable 'Stereo Mix' in sound settings or "
-                "install VB-Cable. "
-                "macOS: install BlackHole and select it."
-            )
 
         ts = time.strftime("%Y-%m-%d_%H%M")
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        tracks = [
-            Track("mic", mic[0], mic[1], self.out_dir / f"{ts}_mic.wav"),
-            Track("system", system[0], system[1],
-                  self.out_dir / f"{ts}_system.wav"),
-        ]
 
         self._pa = pyaudio.PyAudio()
-        for track in tracks:
-            stream = self._pa.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                input_device_index=track.device_index,
-                frames_per_buffer=CHUNK,
-            )
-            writer = _WavWriter(track)
-            pump = threading.Thread(
-                target=self._pump, args=(stream, writer),
-                name=f"pump-{track.kind}", daemon=True,
-            )
-            stream.start_stream()
-            writer.start()
-            pump.start()
-            self._streams.append(stream)
-            self._writers.append(writer)
-            self._pumps.append(pump)
-            log.info("recording %s: %s -> %s",
-                     track.kind, track.device_name, track.out_path)
+        self._recording = True  # lets the pump threads run
+        try:
+            # The mic is required; the system track is best-effort so that a
+            # missing/broken loopback device never kills the whole recording.
+            mic_track = Track("mic", mic[0], mic[1], self.out_dir / f"{ts}_mic.wav")
+            self._start_track(mic_track, required=True)
 
-        self._recording = True
+            if system is None:
+                log.warning(
+                    "no system-audio device found -- recording mic only. "
+                    "Linux: pick a Monitor source. Windows: enable Stereo Mix "
+                    "or install VB-Cable. macOS: install BlackHole."
+                )
+            else:
+                sys_track = Track("system", system[0], system[1],
+                                  self.out_dir / f"{ts}_system.wav")
+                try:
+                    self._start_track(sys_track, required=True)
+                except Exception:
+                    log.exception(
+                        "system-audio device '%s' failed -- continuing with mic only",
+                        system[1],
+                    )
+        except Exception:
+            # The mic (or setup) failed: tear down anything we opened.
+            self._recording = False
+            self.stop()
+            raise
+
         self._started_at = time.time()
-        self._last_paths = [t.out_path for t in tracks]
-        return self._last_paths
+        return list(self._last_paths)
+
+    def _start_track(self, track: Track, required: bool) -> None:
+        """Open, start, and wire up one recording track."""
+        stream = self._open_stream(track)
+        writer = _WavWriter(track)
+        pump = threading.Thread(
+            target=self._pump, args=(stream, writer),
+            name=f"pump-{track.kind}", daemon=True,
+        )
+        stream.start_stream()
+        writer.start()
+        pump.start()
+        self._streams.append(stream)
+        self._writers.append(writer)
+        self._pumps.append(pump)
+        self._last_paths.append(track.out_path)
+        log.info("recording %s: %s (%d Hz) -> %s",
+                 track.kind, track.device_name, track.rate, track.out_path)
 
     def stop(self) -> list[Path]:
         if not self._recording:
+            # Still clean up any half-opened tracks from a failed start().
+            self._teardown()
             return []
         self._recording = False
+        paths = self._teardown()
+        log.info("stopped recording after %.1fs", self.duration)
+        return paths
+
+    def _teardown(self) -> list[Path]:
         for s in self._streams:
             try:
                 s.stop_stream()
@@ -239,7 +294,7 @@ class Recorder:
         for p in self._pumps:
             p.join(timeout=2)
         for w in self._writers:
-            w.stop()
+            w.finish()
             w.join(timeout=5)
         if self._pa:
             self._pa.terminate()
@@ -247,9 +302,7 @@ class Recorder:
         self._pumps.clear()
         self._writers.clear()
         self._pa = None
-        paths = [p for p in self._last_paths if p.exists()]
-        log.info("stopped recording after %.1fs", self.duration)
-        return paths
+        return [p for p in self._last_paths if p.exists()]
 
     # -- internals -------------------------------------------------------
 
