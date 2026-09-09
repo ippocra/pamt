@@ -28,7 +28,7 @@ version = { file = ".version" }
 include = ["pamt*"]
 
 [tool.setuptools.package-data]
-pamt = ["assets/*.png", "assets/*.svg"]
+pamt = ["assets/*.png", "assets/*.svg", "node/clean.js", "node/run.js"]
 
 [project.scripts]
 pamt = "pamt.app:main"

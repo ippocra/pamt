@@ -37,6 +37,11 @@ PAmt lets the transcription step label speakers correctly ("me" vs.
 - **Auto-gain + de-fuzz** — the mic track is automatically amplified to a
   usable speech level (no clipping, thanks to 24-bit headroom), and the
   system track's harsh high-frequency tail is filtered out at the source.
+- **Clean audio (optional)** — one click runs [Desert Ant Labs' Clear
+  model](https://desertant.com/models/clear/) on the latest recording:
+  background noise and room reverb pulled down, loudness normalized.
+  Runs 100% on your machine; the original files are never touched.
+  Opt-in setup — see *Clean audio* below.
 - **Live level meter** — the tray tooltip shows a running timer and per-
   track audio levels while recording.
 - **Graceful degradation** — if the system-audio (loopback) device is
@@ -157,6 +162,55 @@ the two WAVs are designed to be fed to a local ASR engine (e.g.
 whisper.cpp) independently, then merged into a labeled transcript. That
 keeps PAmt light and dependency-free for now.
 
+## Clean audio (Desert Ant Labs Clear)
+
+Optional, opt-in. Runs [Desert Ant Labs' Clear
+model](https://desertant.com/models/clear/) — on-device speech
+enhancement (denoise, dereverb, loudness-normalize) — on the latest
+recording's tracks. Trained for exactly this use case: meeting recorders,
+laptop mics, untreated rooms.
+
+**What you get:** a `<name>_clean.wav` beside each original (the originals
+are never modified), normalized to a broadcast-style speech level. A
+dialog reports the output paths and how long it took.
+
+**Presets** (loudness targets, from the Clear SDK):
+
+- **meeting** (default) — balanced speech, good for listening back and
+  for feeding transcription.
+- **podcast** — a touch louder, broadcast-style.
+- **video** — for voice-over picture.
+- **voiceover** — loudest, VO/announcer-style.
+
+The tray uses the default (meeting) preset; to use another, call the
+library directly:
+
+```python
+from pamt.clean import clean_wav
+res = clean_wav("2026-09-09_1835_mic.wav", preset="podcast")
+print(res.output_path)   # ..._mic_clean.wav
+```
+
+**Setup (once, per machine):** PAmt's core stays dependency-free; clean
+audio needs Node.js 18+ and the Clear SDK:
+
+```bash
+node setup.js        # from this repo; installs the SDK into pamt/node/
+```
+
+Then restart PAmt. The tray shows **✨ Clean audio (latest)…** and
+**⚙ Clean audio status** (the status item tells you exactly what's
+missing if anything is). First clean run downloads the model (~24 MB,
+ONNX) into the shared Desert Ant cache; later runs are ~100x realtime.
+
+**Privacy & license.** Inference is fully local — no audio leaves your
+machine. The SDK/weights are under the [Desert Ant Labs Source-Available
+License](https://license.desertant.com/1.0) (free under 100k monthly
+active devices per model per platform). Clear's SDK sends a minimal
+device-count telemetry ping (no audio, no content) unless disabled; PAmt
+passes through whatever the SDK does by default. PAmt credits Desert Ant
+Labs in its About box, as the license requires.
+
 ## Build from source
 
 Requires Python 3.10+ and PortAudio (`libportaudio2` / `brew install
@@ -169,10 +223,15 @@ pamt            # launch the tray app
 
 ## Privacy
 
-- 100% local. PAmt never phones home.
+- 100% local inference. PAmt never phones home, and Clear runs entirely on
+  your machine — the audio never leaves it.
 - Audio is written only to your disk, in your OS's standard user-data
   location (see *Where recordings are saved*).
-- No network access at all.
+- One exception: if you use the optional **Clean audio** feature, its first
+  run downloads the Clear model (~24 MB) once and caches it, and the Desert
+  Ant SDK sends a minimal usage ping (a device id for their usage
+  attribution — no audio, no content) as its license requires. PAmt itself
+  still makes no network calls.
 
 ## Roadmap
 
@@ -182,6 +241,8 @@ pamt            # launch the tray app
 - [ ] Local transcription (whisper.cpp) with speaker labels
 - [ ] Automatic transcript merge + export (Markdown / SRT)
 - [ ] Per-meeting folders + auto-naming
+- [x] Clean audio (Desert Ant Labs Clear, opt-in)
+- [ ] Clean-audio presets in the tray (podcast / video / voiceover)
 
 ## License
 
