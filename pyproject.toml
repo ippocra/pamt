@@ -5,11 +5,13 @@ dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = [
     "PyAudio>=0.2.13",
-    "pystray>=0.19.5",
     "Pillow>=10.0",
     "pynput>=1.7.6",
     "pyobjc>=10.0; sys_platform == 'darwin'",
 ]
+# NOTE: pystray (system-tray icon) is imported lazily by pamt.app so that a
+# Python missing tkinter fails with a clear, actionable message instead of
+# an opaque ImportError. Install it for a full experience:  pip install pystray
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

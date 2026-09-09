@@ -1,5 +1,9 @@
 # PAmt — Private Annotator Meeting Transcriber
 
+<p align="center">
+  <img src="pamt/assets/logo.svg" alt="PAmt logo" width="120" height="120">
+</p>
+
 Records online meeting audio (Zoom, Teams, Zoho Meet, any browser-based
 call) as **two local WAV tracks** — so *you* can keep track of what was
 said and relisten to the call:
