@@ -22,31 +22,51 @@ from .audio import Recorder
 log = logging.getLogger(__name__)
 
 MEETINGS_DIR = Path.home() / "meetings"
+_ASSETS = Path(__file__).resolve().parent.parent / "assets"
+_ICON_SRC = _ASSETS / "icon_64.png"
+
+
+def _base_icon() -> Image.Image:
+    """Load the packaged logo, falling back to a drawn glyph if missing."""
+    try:
+        return Image.open(_ICON_SRC).convert("RGBA")
+    except OSError:
+        return _icon_image(False, 0)
 
 # Global hotkey: Ctrl+Alt+R  (start/stop)
 HOTKEY_MODS = ("ctrl", "alt")
 HOTKEY_KEY = "r"
 
+_LOGO: Image.Image | None = None  # lazy-cached logo
+
 
 def _icon_image(recording: bool, elapsed: int) -> Image.Image:
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    """Compose the tray icon: logo + red dot/timer overlay while recording.
+
+    The static logo is drawn once and cached; the recording overlay is
+    composited on top each refresh.
+    """
+    global _LOGO
+    try:
+        if _LOGO is None:
+            _LOGO = _base_icon().resize((64, 64), Image.LANCZOS)
+    except Exception:
+        _LOGO = None
+
+    if _LOGO is not None:
+        img = _LOGO.copy()
+    else:
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+
     d = ImageDraw.Draw(img)
-    color = (220, 60, 60, 255) if recording else (120, 120, 120, 255)
-    # rounded square background
-    d.rounded_rectangle([4, 4, 59, 59], radius=12,
-                        fill=(40, 40, 45, 235) if not recording else (70, 25, 25, 235))
-    # mic glyph: capsule
-    d.rounded_rectangle([26, 14, 38, 38], radius=6, fill=color)
-    d.line([32, 38, 32, 46], fill=color, width=3)
-    d.line([24, 46, 40, 46], fill=color, width=3)
-    # recording dot
     if recording:
-        d.ellipse([44, 8, 54, 18], fill=color)
-    # elapsed seconds in corner
-    txt = f"{elapsed // 60:02d}:{elapsed % 60:02d}" if recording else ""
-    if txt:
-        d.text((6, 48), txt, fill=(255, 255, 255, 255))
+        # red dot top-right
+        d.ellipse([44, 6, 56, 18], fill=(225, 59, 59, 255),
+                  outline=(255, 255, 255, 255), width=1)
+        # timer chip bottom
+        txt = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+        d.rounded_rectangle([2, 46, 61, 61], radius=6, fill=(20, 20, 24, 235))
+        d.text((6, 49), txt, fill=(255, 255, 255, 255))
     return img
 
 

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- dark rounded tile -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2d2d2d"/>
+      <stop offset="1" stop-color="#1a1a1a"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="110" fill="url(#tile)"/>
+  <!-- mic capsule -->
+  <rect x="196" y="96" width="120" height="192" rx="60" fill="#f0f0f5"/>
+  <!-- stand -->
+  <rect x="243" y="288" width="26" height="68" fill="#f0f0f5"/>
+  <rect x="176" y="356" width="160" height="26" fill="#f0f0f5"/>
+  <!-- recording dot -->
+  <circle cx="412" cy="112" r="36" fill="#e53935"/>
+</svg>

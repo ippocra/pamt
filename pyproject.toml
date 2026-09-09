@@ -1,7 +1,7 @@
 [project]
 name = "pamt"
-version = "0.1.0"
 description = "Private Annotator Meeting Transcriber - local meeting recorder (mic + system audio)"
+dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = [
     "PyAudio>=0.2.13",
@@ -17,6 +17,9 @@ dev = ["pytest>=8.0"]
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { file = ".version" }
 
 [project.scripts]
 pamt = "pamt.app:main"

@@ -1,0 +1,108 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: linux
+            suffix: linux
+            # PyAudio needs PortAudio headers on Linux
+            pre-install: |
+              sudo apt-get update
+              sudo apt-get install -y portaudio19-dev
+          - os: windows-latest
+            arch: win
+            suffix: windows
+            pre-install: ""
+          - os: macos-latest
+            arch: macos
+            suffix: macos
+            pre-install: |
+              brew install portaudio
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Platform pre-install
+        shell: bash
+        run: |
+          ${{ matrix.pre-install }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller pystray Pillow pynput
+
+      - name: Build binary (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --onefile --clean --name pamt \
+            --add-data "assets:assets" \
+            pamt/app.py
+          mv dist/pamt "dist/pamt-${{ matrix.suffix }}"
+
+      - name: Build binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          pyinstaller --onefile --clean --name pamt \
+            --add-data "assets;assets" \
+            pamt/app.py
+          mv dist/pamt.exe "dist/pamt-${{ matrix.suffix }}.exe"
+
+      - name: Build binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --onefile --clean --name pamt \
+            --add-data "assets:assets" \
+            pamt/app.py
+          mv dist/pamt "dist/pamt-${{ matrix.suffix }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pamt-${{ matrix.suffix }}
+          path: dist/pamt-${{ matrix.suffix }}*
+
+  # Create a GitHub Release when a .version bump is committed.
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: releases
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(git describe --tags --exact-match)
+          gh release create "$VERSION" \
+            --title "PAmt $VERSION" \
+            --notes "PAmt $VERSION — dual-track meeting recorder." \
+            $(find releases -type f | sort)
