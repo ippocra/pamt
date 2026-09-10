@@ -108,7 +108,14 @@ jobs:
           fi
           mkdir -p pamt/node/node
           if [ "$node_ext" = "zip" ]; then
-            (cd pamt/node/node && unzip -qo /tmp/node-dist)
+            # Windows node zips have a top-level folder (node-vX-win-x64/);
+            # unzip has no --strip-components, so extract to a temp dir and
+            # move the inner contents up so node.exe lands at pamt/node/node/.
+            tmpdir=$(mktemp -d)
+            (cd "$tmpdir" && unzip -qo /tmp/node-dist)
+            inner=$(ls "$tmpdir")
+            cp -R "$tmpdir/$inner"/. pamt/node/node/
+            rm -rf "$tmpdir"
           else
             tar -xzf /tmp/node-dist -C pamt/node/node --strip-components=1
           fi
