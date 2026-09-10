@@ -1,8 +1,21 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
 build/
 dist/
-.meetings/
-.pytest_cache/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# PAmt recordings are data, never code
+meetings/
+
+# Clean-audio: the SDK is installed on demand (see `node setup.js`);
+# keep the install scripts and helpers, not the dependency tree.
+pamt/node/node_modules/
+pamt/node/package-lock.json

@@ -1,0 +1,8 @@
+{
+  "name": "pamt-clean-audio",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@desert-ant-labs/clear": "^3.1.0"
+  }
+}

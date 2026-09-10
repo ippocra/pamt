@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw
 
 from . import __version__
 from .audio import Recorder
+from . import clean as clean_audio
 
 log = logging.getLogger(__name__)
 
@@ -209,6 +210,66 @@ class PamtApp:
     def open_latest_system(self) -> None:
         self._open_latest_file("system")
 
+    # -- clean audio (Desert Ant Labs Clear) ----------------------------
+
+    def clean_audio_latest(self) -> None:
+        """Run Clear on the latest recording's tracks (mic + system).
+
+        The heavy run happens on a worker thread; a progress box is shown
+        first and a result box when it finishes. If node / the SDK is not
+        set up, the user gets the actionable setup hint instead of a crash.
+        """
+        latest = _latest_recording(MEETINGS_DIR)
+        if latest is None:
+            _show_message("PAmt", "No recordings yet.")
+            return
+        st = clean_audio.status()
+        if not st["available"]:
+            _show_error(st["hint"])
+            return
+
+        preset = clean_audio.DEFAULT_PRESET
+
+        def _work() -> None:
+            try:
+                results = clean_audio.clean_meeting(latest, preset=preset)
+                lines = []
+                for r in results:
+                    out = r.output_path or "(no output)"
+                    sec = f"{r.processing_sec:.1f}s" if r.processing_sec else "?"
+                    lines.append(f"{Path(r.input_path).name}\n  -> {out}\n     "
+                                 f"({r.duration_sec:.0f}s cleaned in {sec})"
+                                 if r.duration_sec else f"{Path(r.input_path).name}\n  -> {out}")
+                msg = (f"Cleaned with Clear ({preset} preset).\n\n"
+                       + "\n\n".join(lines)
+                       + "\n\nOriginals are untouched.")
+                _show_message(f"{APP_NAME} — clean audio done", msg)
+            except Exception as e:
+                log.exception("clean audio failed")
+                _show_error(f"Clean audio failed:\n{e}")
+
+        # Progress box is non-blocking on some OSes; start the work immediately
+        # and let the result box (above) tell the user it's done.
+        _show_message(
+            f"{APP_NAME} — cleaning audio…",
+            f"Running Clear on the latest recording ({latest.name})…\n"
+            f"First run downloads the model (~24 MB) and is slower.\n\n"
+            f"You can keep using the meeting; a result box appears when done.",
+        )
+        threading.Thread(target=_work, name="clean-audio", daemon=True).start()
+
+    def clean_audio_status(self) -> None:
+        """Show whether clean audio is usable and what to do if not."""
+        st = clean_audio.status()
+        if st["available"]:
+            _show_message(
+                f"{APP_NAME} — clean audio",
+                f"Ready. node: {st['node']}\n"
+                "Use 'Clean audio (latest)' from the tray.",
+            )
+        else:
+            _show_error(st["hint"])
+
     def _open_latest_file(self, kind: str) -> None:
         latest = _latest_recording(MEETINGS_DIR)
         if latest is None:
@@ -297,6 +358,8 @@ class PamtApp:
         text = (
             f"{APP_NAME}  v{__version__}\n"
             "Private Annotator Meeting Transcriber\n\n"
+            "Clean audio: Powered by Desert Ant Labs (Clear)\n"
+            "https://desertant.com\n\n"
             f"Source: {GITHUB_URL}\n"
         )
         _show_message(f"{APP_NAME} — About", text)
@@ -398,6 +461,8 @@ class PamtApp:
                 latest_item,
                 pystray.MenuItem("  ↳ mic track", self.open_latest_mic),
                 pystray.MenuItem("  ↳ system track", self.open_latest_system),
+                pystray.MenuItem("  ✨ Clean audio (latest)…", self.clean_audio_latest),
+                pystray.MenuItem("  ⚙ Clean audio status", self.clean_audio_status),
                 pystray.MenuItem("Open recordings folder", self.open_recordings_folder),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("⚙ Choose audio devices…", self.choose_devices),
