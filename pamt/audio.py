@@ -10,13 +10,19 @@ Each track is **captured at 24-bit** (when the device allows it) for the best
 possible signal-to-noise and headroom, then written as a **16-bit mono WAV**
 at the device's *native* sample rate. 24-bit capture is the source-level fix
 for two common problems: laptop mics record very quietly (24-bit gives ~18 dB
-more headroom to amplify them *without* clipping), and low-quality loopback
-capture carries a harsh high-frequency tail (more bits = lower noise floor).
-The files stay 16-bit because Whisper wants 16-bit, so nothing downstream
-changes. Different devices support different rates (WASAPI on Windows is
-especially picky), so we open each stream at the rate the device actually
-accepts rather than forcing one global rate; Whisper resamples at
-transcription time, so the per-track rates need not match.
+more headroom) and low-quality loopback capture carries a harsh high-frequency
+tail (more bits = lower noise floor). The files stay 16-bit because Whisper
+wants 16-bit, so nothing downstream changes. Different devices support
+different rates (WASAPI on Windows is especially picky), so we open each
+stream at the rate the device actually accepts rather than forcing one global
+rate; Whisper resamples at transcription time, so the per-track rates need not
+match.
+
+PAmt captures the raw signal **exactly as the device delivers it** -- no
+gain, no filtering, no other modification happens at record time. All audio
+cleaning (denoise, dereverb, loudness) is left to the Clear model at
+post-processing time (see ``pamt.clean``), which works on the untouched
+original.
 
 Device hints:
     Linux   -- system audio: a Pulse/PipeWire "Monitor" source
@@ -47,21 +53,6 @@ CHUNK = 1024
 DEFAULT_RATE = 44_100
 # Rates to try (most common first) when we can't open at the native rate.
 _FALLBACK_RATES = (48_000, 44_100, 16_000)
-
-# Auto-gain for the *mic* track: laptop mics record very quietly (~ -40 dB
-# RMS). We lift it toward a normal speech level (target ~ -18 dB) so
-# transcription has something to work with. Because we capture at 24-bit the
-# boost has real headroom and won't clip. Values are in dB.
-GAIN_TARGET_DB = -18.0       # aim the mic's average level here
-GAIN_THRESHOLD_DB = -30.0    # only boost tracks quieter than this
-GAIN_CAP_DB = 48.0           # never boost more than this (24-bit headroom)
-GAIN_FLOOR_DB = 0.0          # never attenuate a loud track
-
-# Low-pass the *system* track: loopback capture of compressed web audio often
-# carries a harsh high-frequency tail (aliasing/harshness above ~4-8 kHz) that
-# sounds "fuzzy". Whisper band-limits to 8 kHz anyway, so cutting the HF tail
-# cleans the track and removes the fuzz. `state` carries continuity.
-LOWPASS_HZ = 8_000
 
 # Keywords that identify a system-output (loopback) capture device.
 _SYSTEM_HINTS = (
@@ -138,47 +129,12 @@ def guess_devices() -> tuple[tuple[int, str] | None, tuple[int, str] | None]:
 
 
 def _rms(data: bytes) -> float:
-    """RMS of 16-bit PCM, scaled to ~0..1."""
+    """RMS of 16-bit PCM, scaled to ~0..1 (level meter only)."""
     n = len(data) // 2
     if n == 0:
         return 0.0
     samples = struct.unpack(f"<{n}h", data[: n * 2])
     return min(1.0, ((sum(s * s for s in samples) / n) ** 0.5) / 8000.0)
-
-
-def _apply_gain_16(data: bytes, gain_db: float) -> bytes:
-    """Multiply 16-bit PCM by a gain (dB), clamping to prevent clipping."""
-    if gain_db <= 0:
-        return data
-    factor = 10.0 ** (gain_db / 20.0)
-    n = len(data) // 2
-    samples = struct.unpack(f"<{n}h", data[: n * 2])
-    out = [max(-32768, min(32767, int(round(s * factor)))) for s in samples]
-    return struct.pack(f"<{n}h", *out)
-
-
-def _lowpass_16(data: bytes, rate: int, cutoff_hz: float,
-                state: list[float]) -> bytes:
-    """2-pole low-pass (steeper roll-off) for the system track.
-
-    Removes the harsh high-frequency tail (aliasing/harshness). `state` holds
-    the two previous filter outputs so the filter is continuous across chunks.
-    """
-    if cutoff_hz <= 0:
-        return data
-    r = 2.0 * 3.141592653589793 * cutoff_hz / rate
-    alpha = r / (1.0 + r)
-    n = len(data) // 2
-    samples = struct.unpack(f"<{n}h", data[: n * 2])
-    s0 = state[0] if len(state) > 0 else 0.0
-    s1 = state[1] if len(state) > 1 else 0.0
-    out = []
-    for s in samples:
-        s0 = s0 + alpha * (s - s0)
-        s1 = s1 + alpha * (s0 - s1)
-        out.append(int(round(max(-32768, min(32767, s1)))))
-    state[0], state[1] = s0, s1
-    return struct.pack(f"<{n}h", *out)
 
 
 # -- 24-bit helpers -------------------------------------------------------
@@ -198,51 +154,13 @@ def _unpack_24(data: bytes) -> list[int]:
     return out
 
 
-def _pack_24(samples: list[int]) -> bytes:
-    """Encode signed ints back to little-endian 24-bit PCM."""
-    out = bytearray()
-    for v in samples:
-        v &= 0xFFFFFF
-        out += bytes((v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF))
-    return bytes(out)
-
-
 def _rms_24(data: bytes) -> float:
-    """RMS of 24-bit PCM, scaled to ~0..1."""
+    """RMS of 24-bit PCM, scaled to ~0..1 (level meter only)."""
     samples = _unpack_24(data)
     n = len(samples)
     if n == 0:
         return 0.0
     return min(1.0, ((sum(s * s for s in samples) / n) ** 0.5) / 8_388_608.0)
-
-
-def _apply_gain_24(data: bytes, gain_db: float) -> bytes:
-    """Multiply 24-bit PCM by a gain (dB), clamped to the 24-bit range."""
-    if gain_db <= 0:
-        return data
-    factor = 10.0 ** (gain_db / 20.0)
-    samples = _unpack_24(data)
-    return _pack_24([max(-8_388_608, min(8_388_607, int(round(s * factor))))
-                     for s in samples])
-
-
-def _lowpass_24(data: bytes, rate: int, cutoff_hz: float,
-                state: list[float]) -> bytes:
-    """2-pole low-pass on 24-bit PCM (continuous across chunks via `state`)."""
-    if cutoff_hz <= 0:
-        return data
-    r = 2.0 * 3.141592653589793 * cutoff_hz / rate
-    alpha = r / (1.0 + r)
-    samples = _unpack_24(data)
-    s0 = state[0] if len(state) > 0 else 0.0
-    s1 = state[1] if len(state) > 1 else 0.0
-    out = []
-    for s in samples:
-        s0 = s0 + alpha * (s - s0)
-        s1 = s1 + alpha * (s0 - s1)
-        out.append(int(round(max(-8_388_608, min(8_388_607, s1)))))
-    state[0], state[1] = s0, s1
-    return _pack_24(out)
 
 
 def _downmix_24_to_16(data: bytes) -> bytes:
@@ -451,16 +369,17 @@ class Recorder:
     # -- internals -------------------------------------------------------
 
     def _pump(self, stream: pyaudio.Stream, writer: _WavWriter) -> None:
+        """Read PCM frames and write them to the WAV file **unmodified**.
+
+        PAmt records the raw device signal as-is: no gain, no filtering.
+        Audio cleaning (denoise / dereverb / loudness) is left to the Clear
+        model at post-processing time (see ``pamt.clean``), which works on
+        the untouched original. The only per-frame work is the RMS for the
+        tray level meter.
+        """
         kind = writer.track.kind
-        fmt = writer.track.format
-        is24 = (fmt == pyaudio.paInt24)
-        apply_gain = kind == "mic"
-        apply_lp = kind == "system"
-        avg: list[float] = []           # recent RMS (linear) for stable mic gain
-        lp_state: list[float] = [0.0, 0.0]   # 2-pole low-pass continuity state
+        is24 = (writer.track.format == pyaudio.paInt24)
         rms_fn = _rms_24 if is24 else _rms
-        gain_fn = _apply_gain_24 if is24 else _apply_gain_16
-        lp_fn = (_lowpass_24 if is24 else _lowpass_16)
         downmix = _downmix_24_to_16 if is24 else _downmix_16_to_16
         while self._recording:
             try:
@@ -469,33 +388,8 @@ class Recorder:
                 log.exception("read error on %s", kind)
                 time.sleep(0.01)
                 continue
-            rms = rms_fn(data)
-            self._levels[kind] = rms
-            if apply_gain:
-                data = self._gained(data, rms, avg, gain_fn)
-            if apply_lp:
-                data = lp_fn(data, writer.track.rate, LOWPASS_HZ, lp_state)
+            self._levels[kind] = rms_fn(data)
             writer.push(downmix(data))   # writer always expects 16-bit
-
-    def _gained(self, data: bytes, rms: float, avg: list[float],
-                gain_fn) -> bytes:
-        """Amplify quiet mic audio toward a usable level (see GAIN_TARGET_DB).
-
-        Uses a short moving average of RMS so the gain is steady rather than
-        "pumping" with the speech envelope. Loud input (above the threshold)
-        passes through untouched; we never attenuate.
-        """
-        avg.append(rms)
-        if len(avg) > 8:
-            avg.pop(0)
-        recent = sum(avg) / len(avg)
-        if recent <= 0.0005:            # effectively silent -> no useful level
-            return data
-        recent_db = 20.0 * (recent ** 0.5) - 20.0  # approx dBFS from 0..1 RMS
-        if recent_db >= GAIN_THRESHOLD_DB:
-            return data
-        gain = min(GAIN_CAP_DB, max(GAIN_FLOOR_DB, GAIN_TARGET_DB - recent_db))
-        return gain_fn(data, gain)
 
     # -- introspection ---------------------------------------------------
 

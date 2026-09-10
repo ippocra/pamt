@@ -14,15 +14,16 @@ How it is wired up (kept deliberately thin):
   shell out to a small helper script (``node/clean.js``, invoked via
   ``node/run.js``) with ``node``. The helper is the only thing that knows
   the SDK's API; Python just feeds it file paths and reads back JSON.
-* ``node`` and the SDK are **optional** at install time. If they are not
-  present, PAmt still works exactly as before -- recording is untouched --
-  and the tray shows an actionable "set up clean audio" note instead of a
-  broken menu item. Setup is: ``node setup.js`` from the repo (or the steps
-  in the README, "Clean audio").
-* Model weights (~24 MB, LiteRT/TFLite) download once on first use and
-  cache in the platform model cache, shared with other Desert Ant apps.
-  Nothing else leaves the machine except the SDK's minimal usage ping (a
-  device id, no audio) -- see the README's Privacy section.
+* ``node`` and the SDK are **baked in**: the SDK lives in
+  ``pamt/node/node_modules`` (installed by ``node setup.js``, shipped via
+  package-data in the wheel and PyInstaller binary), and PAmt finds ``node``
+  on PATH or bundled. In a bare source checkout the SDK may be missing; the
+  tray then shows an actionable setup hint instead of a broken menu item.
+* Model weights (~24 MB, LiteRT/TFLite) download once on the first clean
+  run and cache in ``<user cache>/desert-ant-models`` (``XDG_CACHE_HOME``
+  aware), shared with other Desert Ant apps. Nothing else leaves the machine
+  except the SDK's minimal usage ping (a device id, no audio) -- see the
+  README's Privacy section.
 
 Loudness presets
 ----------------
@@ -47,6 +48,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -111,7 +113,7 @@ def node_binary() -> Optional[str]:
 
 
 def _sdk_ready() -> bool:
-    """True if the helper + SDK modules are importable from NODE_DIR."""
+    """True if the helper + the Clear SDK are present (bundled or installed)."""
     if not _HELPER_JS.is_file():
         return False
     if not _LAUNCHER_JS.is_file():
@@ -119,30 +121,79 @@ def _sdk_ready() -> bool:
     return (NODE_DIR / "node_modules" / "@desert-ant-labs" / "clear").is_dir()
 
 
+def _model_cache_dir() -> Path:
+    """Where the Clear model weights live (per-user, XDG_CACHE_HOME aware)."""
+    try:
+        from platformdirs import user_cache_dir
+        return Path(user_cache_dir("PAmt"))
+    except Exception:  # pragma: no cover
+        return Path.home() / ".cache" / "PAmt"
+
+
+def _model_ready() -> bool:
+    """True if the Clear model weights are already cached on this machine."""
+    marker = _model_cache_dir() / "desert-ant-models"
+    return any(marker.rglob("*")) if marker.is_dir() else False
+
+
+def warm_up_model(timeout: float = 600.0) -> None:
+    """Download the Clear model weights (~24 MB) once, in the background.
+
+    Run at app start when clean audio is enabled (the default): the first
+    real clean run is then fast and never surprises the user with a network
+    fetch mid-meeting. A no-op when the weights are already cached. Any
+    failure (offline, missing node) is swallowed -- clean audio simply
+    downloads on first use instead.
+    """
+    def _work() -> None:
+        try:
+            proc, stderr_text = _run_node(
+                ["--warm-up", "--cache-root", str(_model_cache_dir())],
+                timeout=timeout,
+            )
+            if proc.returncode == 0:
+                log.info("clear model ready: %s", _model_cache_dir())
+            else:
+                log.warning("clear model warm-up failed (exit %s): %s",
+                            proc.returncode, (stderr_text or "")[-300:])
+        except Exception as e:
+            log.warning("clear model warm-up failed: %s", e)
+
+    threading.Thread(target=_work, name="clear-model-warmup",
+                     daemon=True).start()
+
+
 def status() -> dict:
     """Report whether clean audio is usable, with a setup hint if not.
 
     Returns a dict with keys: ``available`` (bool), ``node`` (str|None),
-    ``sdk`` (bool), ``hint`` (str -- empty when available).
+    ``sdk`` (bool), ``model`` (bool -- weights cached), ``hint`` (str --
+    empty when available).
     """
     node = node_binary()
     sdk = _sdk_ready()
+    model = _model_ready()
     if node and sdk:
-        return {"available": True, "node": node, "sdk": True, "hint": ""}
+        hint = ""
+        if not model:
+            hint = ("Model weights will download on first use "
+                    f"(~24 MB -> {_model_cache_dir()}).")
+        return {"available": True, "node": node, "sdk": True,
+                "model": model, "hint": hint}
     missing = []
     if not node:
         missing.append("Node.js (node on PATH, or run the bundled setup)")
     if not sdk:
         missing.append(
-            "the Clear SDK (install with `npm i --prefix "
-            f"{NODE_DIR} @desert-ant-labs/clear`)"
+            "the Clear SDK (install with `node setup.js` from this repo, "
+            "or use an official PAmt binary which bundles it)"
         )
     hint = (
             "Clean audio needs: " + " and ".join(missing) + ".\n"
-            "Run the setup script in this repo (setup.js) or the steps in the "
-            "README ('Clean audio' section), then restart PAmt."
+            "Run `node setup.js` from the repo, then restart PAmt."
         )
-    return {"available": False, "node": node, "sdk": sdk, "hint": hint}
+    return {"available": False, "node": node, "sdk": sdk,
+            "model": model, "hint": hint}
 
 
 def _run_node(argv: list[str], timeout: float):
@@ -191,7 +242,8 @@ def clean_wav(path: str | Path, preset: str = DEFAULT_PRESET) -> CleanResult:
     timeout = 600.0 + (MAX_INPUT_SECONDS / 60.0) * 30.0
     try:
         proc, stderr_text = _run_node(
-            ["--clean", str(p), "--preset", preset],
+            ["--clean", str(p), "--preset", preset,
+             "--cache-root", str(_model_cache_dir())],
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:

@@ -16,6 +16,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from . import __version__
+from . import config
 from .audio import Recorder
 from . import clean as clean_audio
 
@@ -31,6 +32,22 @@ try:
 except Exception:  # pragma: no cover - platformdirs should always be present
     _DATA_ROOT = Path.home() / ".pamt"
 MEETINGS_DIR = _DATA_ROOT / "meetings"
+
+# Legacy recording locations from earlier PAmt versions. Recordings written
+# there are still valid, so every lookup checks them after the canonical
+# directory. (v0.1.0 wrote to ~/meetings; the platformdirs-based layout
+# arrived in v0.3.0.)
+_LEGACY_MEETINGS_DIRS = (
+    Path.home() / ".pamt" / "meetings",
+    Path.home() / "meetings",
+)
+
+
+def _meetings_dirs() -> tuple[Path, ...]:
+    """Recording directories, canonical first, legacy locations after."""
+    return (MEETINGS_DIR,) + tuple(
+        d for d in _LEGACY_MEETINGS_DIRS if d.resolve() != MEETINGS_DIR.resolve()
+    )
 _ASSETS = Path(__file__).resolve().parent / "assets"
 _ICON_SRC = _ASSETS / "icon_64.png"
 
@@ -135,16 +152,23 @@ def _show_error(msg: str) -> None:
         print(f"\nPAmt error:\n{msg}\n", file=sys.stderr, flush=True)
 
 
-def _recording_dirs(base: Path) -> list[Path]:
-    """Timestamped recording subfolders, newest first."""
-    if not base.is_dir():
-        return []
-    dirs = [d for d in base.iterdir()
-            if d.is_dir() and _TS_RE.match(d.name)]
+def _recording_dirs(base: Path | None = None) -> list[Path]:
+    """Timestamped recording subfolders, newest first.
+
+    With no *base*, the canonical meetings directory plus the legacy
+    locations are all scanned, so recordings made by older PAmt versions
+    (which saved to a different path) are still found.
+    """
+    bases = [base] if base is not None else _meetings_dirs()
+    dirs: list[Path] = []
+    for b in bases:
+        if b.is_dir():
+            dirs.extend(d for d in b.iterdir()
+                        if d.is_dir() and _TS_RE.match(d.name))
     return sorted(dirs, key=lambda d: d.name, reverse=True)
 
 
-def _latest_recording(base: Path) -> Path | None:
+def _latest_recording(base: Path | None = None) -> Path | None:
     return _recording_dirs(base)[0] if _recording_dirs(base) else None
 
 
@@ -160,6 +184,9 @@ class PamtApp:
         # the item in the menu (see _set_item_text), not by writing .text.
         self._record_item = None
         self._latest_item = None
+        self._clean_item = None
+        self._toggle_clean_item = None
+        self._clean_enabled = config.is_clean_audio_enabled()
 
     # -- actions ---------------------------------------------------------
 
@@ -200,9 +227,9 @@ class PamtApp:
         self._open_path(MEETINGS_DIR)
 
     def open_latest_recording(self) -> None:
-        latest = _latest_recording(MEETINGS_DIR)
+        latest = _latest_recording()
         if latest is None:
-            _show_message("PAmt", f"No recordings yet.\nRecordings save to:\n{MEETINGS_DIR}")
+            _show_message("PAmt", f"No recordings yet.\nNew recordings save to:\n{MEETINGS_DIR}")
             return
         self._open_path(latest)
 
@@ -221,7 +248,14 @@ class PamtApp:
         first and a result box when it finishes. If node / the SDK is not
         set up, the user gets the actionable setup hint instead of a crash.
         """
-        latest = _latest_recording(MEETINGS_DIR)
+        if not self._clean_enabled:
+            _show_message(
+                APP_NAME,
+                "Clean audio is disabled.\n"
+                "Enable it from the tray (\"Enable clean audio\").",
+            )
+            return
+        latest = _latest_recording()
         if latest is None:
             _show_message("PAmt", "No recordings yet.")
             return
@@ -255,25 +289,46 @@ class PamtApp:
         _show_message(
             f"{APP_NAME} — cleaning audio…",
             f"Running Clear on the latest recording ({latest.name})…\n"
-            f"First run downloads the model (~24 MB) and is slower.\n\n"
-            f"You can keep using the meeting; a result box appears when done.",
+            + ("First run downloads the model (~24 MB) and is slower.\n\n"
+               if not clean_audio.status()["model"] else "")
+            + "You can keep using the meeting; a result box appears when done.",
         )
         threading.Thread(target=_work, name="clean-audio", daemon=True).start()
 
     def clean_audio_status(self) -> None:
         """Show whether clean audio is usable and what to do if not."""
+        if not self._clean_enabled:
+            _show_message(
+                APP_NAME,
+                "Clean audio is disabled (setting: clean_audio_enabled=false).\n"
+                "Enable it from the tray (\"Enable clean audio\").",
+            )
+            return
         st = clean_audio.status()
         if st["available"]:
             _show_message(
                 f"{APP_NAME} — clean audio",
                 f"Ready. node: {st['node']}\n"
-                "Use 'Clean audio (latest)' from the tray.",
+                + ("Model cached.\n" if st["model"] else st["hint"] + "\n")
+                + "Use 'Clean audio (latest)' from the tray.",
             )
         else:
             _show_error(st["hint"])
 
+    def toggle_clean_audio(self) -> None:
+        """Flip the clean-audio setting (on by default) and persist it."""
+        self._clean_enabled = not self._clean_enabled
+        config.set_value("clean_audio_enabled", self._clean_enabled)
+        self._refresh_clean_labels()
+        _show_message(
+            APP_NAME,
+            f"Clean audio (Desert Ant Labs Clear) is now "
+            f"{'enabled' if self._clean_enabled else 'disabled'}.\n"
+            "The setting is saved; it applies from this moment on.",
+        )
+
     def _open_latest_file(self, kind: str) -> None:
-        latest = _latest_recording(MEETINGS_DIR)
+        latest = _latest_recording()
         if latest is None:
             _show_message("PAmt", "No recordings yet.")
             return
@@ -353,7 +408,7 @@ class PamtApp:
         root.mainloop()
 
     def about(self) -> None:
-        """Show the About box (name, version, repo link) and open the repo."""
+        """Show the About box (logo, name, version, credits, repo link)."""
         self._show_about()
 
     def _show_about(self) -> None:
@@ -364,13 +419,59 @@ class PamtApp:
             "https://desertant.com\n\n"
             f"Source: {GITHUB_URL}\n"
         )
-        _show_message(f"{APP_NAME} — About", text)
+        # Cross-platform About box with the PAmt logo on top. tkinter is
+        # already a hard requirement of the tray, so this is safe; any
+        # failure falls back to the plain message box.
+        try:
+            self._show_about_dialog(text)
+        except Exception:
+            log.exception("about dialog failed, falling back to message box")
+            _show_message(f"{APP_NAME} — About", text)
         # Also open the repo in the default browser (best-effort).
         try:
             import webbrowser
             webbrowser.open(GITHUB_URL)
         except Exception:
             log.exception("could not open browser")
+
+    def _show_about_dialog(self, text: str) -> None:
+        """A real dialog: logo image + text. Blocks while open."""
+        import tkinter as tk
+        from tkinter import ttk
+
+        root = tk.Tk()
+        root.title(f"{APP_NAME} — About")
+        root.resizable(False, False)
+
+        # The 256px PNG logo is the reliable cross-platform source
+        # (Pillow only reads SVGs with a special build); the 64px tray
+        # icon is the fallback if the logo file is missing.
+        logo_src = _ASSETS / "icon_256.png"
+        try:
+            logo_img = Image.open(logo_src if logo_src.is_file() else _ICON_SRC)
+        except OSError:
+            logo_img = _fallback_glyph(False, 0)
+        logo_img = logo_img.convert("RGBA").resize((96, 96), Image.LANCZOS)
+        img_file = f"about_logo_{id(logo_img)}.png"
+        logo_img.save(img_file)
+        try:
+            photo = tk.PhotoImage(file=img_file)
+        except Exception:
+            photo = None
+
+        if photo is not None:
+            ttk.Label(root, image=photo).pack(pady=(14, 4))
+        tk.Label(root, text=text, justify="center",
+                 font=("Segoe UI", 10)).pack(padx=18, pady=(0, 12))
+        ttk.Button(root, text="OK", command=root.destroy).pack(pady=(0, 10))
+        root.grab_set()
+        root.mainloop()
+        if img_file:
+            try:
+                import os
+                os.remove(img_file)
+            except OSError:
+                pass
 
     def quit(self) -> None:
         if self.recorder.recording:
@@ -448,11 +549,33 @@ class PamtApp:
     def _refresh_latest_label(self) -> None:
         if self._latest_item is None:
             return
-        latest = _latest_recording(MEETINGS_DIR)
+        latest = _latest_recording()
         self._set_item_text(
             self._latest_item,
             f"Open latest recording  ({latest.name})" if latest
             else "Open latest recording  (none yet)")
+
+    def _clean_label(self) -> str:
+        return "  ✨ Clean audio (latest)…" if self._clean_enabled \
+            else "  ✨ Clean audio (latest)  (off)"
+
+    def _toggle_clean_label(self) -> str:
+        # The toggle offers the *opposite* of the current state: when clean
+        # audio is on, the item reads "Disable clean audio" (and vice versa),
+        # so clicking it flips the setting.
+        return "Disable clean audio" if self._clean_enabled \
+            else "Enable clean audio"
+
+    def _refresh_clean_labels(self) -> None:
+        """Refresh the clean-audio menu labels after a state change."""
+        try:
+            if self._clean_item is not None:
+                self._set_item_text(self._clean_item, self._clean_label())
+            if self._toggle_clean_item is not None:
+                self._set_item_text(self._toggle_clean_item,
+                                    self._toggle_clean_label())
+        except Exception:
+            log.exception("clean menu refresh failed")
 
     # -- UI loop ---------------------------------------------------------
 
@@ -485,6 +608,18 @@ class PamtApp:
         self._latest_item = latest_item
         self._refresh_latest_label()
 
+        clean_item = pystray.MenuItem(
+            self._clean_label(), self.clean_audio_latest,
+        )
+        self._clean_item = clean_item
+        clean_status_item = pystray.MenuItem("  ⚙ Clean audio status",
+                                             self.clean_audio_status)
+        toggle_clean_item = pystray.MenuItem(
+            self._toggle_clean_label(), self.toggle_clean_audio,
+            default=self._clean_enabled,
+        )
+        self._toggle_clean_item = toggle_clean_item
+
         icon = pystray.Icon(
             "pamt",
             _icon_image(False, 0),
@@ -495,8 +630,9 @@ class PamtApp:
                 latest_item,
                 pystray.MenuItem("  ↳ mic track", self.open_latest_mic),
                 pystray.MenuItem("  ↳ system track", self.open_latest_system),
-                pystray.MenuItem("  ✨ Clean audio (latest)…", self.clean_audio_latest),
-                pystray.MenuItem("  ⚙ Clean audio status", self.clean_audio_status),
+                clean_item,
+                clean_status_item,
+                toggle_clean_item,
                 pystray.MenuItem("Open recordings folder", self.open_recordings_folder),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("⚙ Choose audio devices…", self.choose_devices),
@@ -506,6 +642,10 @@ class PamtApp:
             ),
         )
         self._icon = icon
+        if self._clean_enabled and clean_audio.status()["available"]:
+            # Model weights download once (~24 MB); kick it off in the
+            # background now so the first clean run is instant.
+            clean_audio.warm_up_model()
         icon.run()  # blocks on the tray event loop until stop()
 
     def _install_hotkey(self) -> None:

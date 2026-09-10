@@ -47,6 +47,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyaudio pystray pillow pynput platformdirs pyinstaller
 
+      - name: Install Clear SDK (baked into the binary)
+        shell: bash
+        run: |
+          # Installs @desert-ant-labs/clear into pamt/node/node_modules;
+          # PyInstaller's --collect-all pamt then ships it in the binary so
+          # clean audio works out of the box.
+          node setup.js   # installs the Clear SDK into pamt/node/
+          npm ci          # exact versions from pamt/node/package-lock.json
+
       - name: Build binary (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -107,5 +116,5 @@ jobs:
           VERSION=$(git describe --tags --exact-match)
           gh release create "$VERSION" \
             --title "PAmt $VERSION" \
-            --notes "PAmt $VERSION — dual-track meeting recorder." \
+            --notes "$(cat CHANGELOG.md 2>/dev/null | sed -n "/^## $VERSION/,/^## /p" | sed '$d' || echo 'PAmt $VERSION — dual-track meeting recorder.')" \
             $(find releases -type f | sort)
