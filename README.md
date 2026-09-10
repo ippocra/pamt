@@ -34,14 +34,17 @@ PAmt lets the transcription step label speakers correctly ("me" vs.
 - **Choose your devices** — right-click → **⚙ Choose audio devices** to
   pick exactly which mic and which system-audio (loopback) device to use,
   instead of relying on auto-detection.
-- **Auto-gain + de-fuzz** — the mic track is automatically amplified to a
-  usable speech level (no clipping, thanks to 24-bit headroom), and the
-  system track's harsh high-frequency tail is filtered out at the source.
-- **Clean audio (optional)** — one click runs [Desert Ant Labs' Clear
+- **Raw, unprocessed capture** — PAmt records exactly what the device
+  delivers: no gain, no filtering, no resampling. All cleanup is
+  optional and done *after* the fact (see *Clean audio*), so the
+  originals are always pristine.
+- **Clean audio (on by default)** — one click runs [Desert Ant Labs' Clear
   model](https://desertant.com/models/clear/) on the latest recording:
   background noise and room reverb pulled down, loudness normalized.
-  Runs 100% on your machine; the original files are never touched.
-  Opt-in setup — see *Clean audio* below.
+  Runs 100% on your machine; the model is baked into the binary and the
+  ~24 MB of weights download once on first use. The original files are
+  never touched. Toggle it on/off from the tray ("Disable/Enable clean
+  audio") — the choice is remembered.
 - **Live level meter** — the tray tooltip shows a running timer and per-
   track audio levels while recording.
 - **Graceful degradation** — if the system-audio (loopback) device is
@@ -129,10 +132,11 @@ you what to enable.
 
 Each track is **captured at 24-bit** (falling back to 16-bit if a device
 can't open 24-bit) and written as a **16-bit mono WAV**. Capturing at
-24-bit is the source-level quality fix: it gives ~18 dB more headroom, so
-quiet laptop mics can be amplified *without* clipping and the noise floor
-drops. The files stay 16-bit because the transcription engine (whisper.cpp)
-wants 16-bit, so nothing downstream changes.
+24-bit gives ~18 dB more headroom, so quiet laptop mics are recorded
+without clipping — and PAmt applies **no gain, no filtering, no
+resampling** to the capture: the WAVs are the raw device signal, which is
+what you want for transcription and for any after-the-fact cleanup (see
+*Clean audio*).
 
 Each track is recorded at the **device's native sample rate**. WASAPI on
 Windows is picky about rates, so PAmt opens each device at the rate it
@@ -164,7 +168,8 @@ keeps PAmt light and dependency-free for now.
 
 ## Clean audio (Desert Ant Labs Clear)
 
-Optional, opt-in. Runs [Desert Ant Labs' Clear
+On by default (toggle: right-click → **Disable/Enable clean audio**).
+Runs [Desert Ant Labs' Clear
 model](https://desertant.com/models/clear/) — on-device speech
 enhancement (denoise, dereverb, loudness-normalize) — on the latest
 recording's tracks. Trained for exactly this use case: meeting recorders,
@@ -191,17 +196,19 @@ res = clean_wav("2026-09-09_1835_mic.wav", preset="podcast")
 print(res.output_path)   # ..._mic_clean.wav
 ```
 
-**Setup (once, per machine):** PAmt's core stays dependency-free; clean
-audio needs Node.js 18+ and the Clear SDK:
+**Setup.** The Clear SDK is **baked into the released binaries** (and the
+wheel), so nothing to install — the first clean run just downloads the
+~24 MB of model weights (ONNX) into the shared Desert Ant cache; later
+runs are ~100x realtime. When running **from source**, PAmt needs a
+`node` on `PATH` (or in `~/.pamt/node`) plus the SDK in
+`pamt/node/node_modules`:
 
 ```bash
 node setup.js        # from this repo; installs the SDK into pamt/node/
 ```
 
-Then restart PAmt. The tray shows **✨ Clean audio (latest)…** and
-**⚙ Clean audio status** (the status item tells you exactly what's
-missing if anything is). First clean run downloads the model (~24 MB,
-ONNX) into the shared Desert Ant cache; later runs are ~100x realtime.
+The tray shows **✨ Clean audio (latest)…** and **⚙ Clean audio status**
+(the status item tells you exactly what's missing if anything is).
 
 **Privacy & license.** Inference is fully local — no audio leaves your
 machine. The SDK/weights are under the [Desert Ant Labs Source-Available
@@ -241,7 +248,7 @@ pamt            # launch the tray app
 - [ ] Local transcription (whisper.cpp) with speaker labels
 - [ ] Automatic transcript merge + export (Markdown / SRT)
 - [ ] Per-meeting folders + auto-naming
-- [x] Clean audio (Desert Ant Labs Clear, opt-in)
+- [x] Clean audio (Desert Ant Labs Clear, on by default)
 - [ ] Clean-audio presets in the tray (podcast / video / voiceover)
 
 ## License

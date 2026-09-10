@@ -15,7 +15,8 @@ venv/
 # PAmt recordings are data, never code
 meetings/
 
-# Clean-audio: the SDK is installed on demand (see `node setup.js`);
-# keep the install scripts and helpers, not the dependency tree.
+# Clean-audio: the Clear SDK is installed into the package by `node setup.js`
+# and then SHIPPED with the wheel/binary (see pyproject package-data).
+# It stays out of git; setup.js reinstalls it locally for dev and the CI
+# build step does it before PyInstaller.
 pamt/node/node_modules/
-pamt/node/package-lock.json

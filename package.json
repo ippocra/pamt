@@ -1,0 +1,6 @@
+{
+  "name": "pamt",
+  "private": true,
+  "type": "module",
+  "description": "PAmt — tray app for meeting recordings. Root package.json only sets the module type for setup.js; the Clear SDK lives in pamt/node/."
+}
