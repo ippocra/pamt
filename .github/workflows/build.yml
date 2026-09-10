@@ -36,8 +36,9 @@ jobs:
       # bundle into the binary. Keep in sync with the Clear SDK's requirements.
       NODE_VERSION: "22.17.0"
       # All steps that need the venv use its python directly (no `source
-      # activate`), which is the same on Linux/macOS and Windows Git Bash.
-      VENV_PY: .venv/bin/python
+      # activate`). Windows venvs use .venv\Scripts\python.exe; Linux/macOS use
+      # .venv/bin/python.
+      VENV_PY: ${{ matrix.platform == 'windows' && '.venv\Scripts\python.exe' || '.venv/bin/python' }}
 
     steps:
       - name: Check out repository
