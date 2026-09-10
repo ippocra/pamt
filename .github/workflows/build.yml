@@ -22,6 +22,7 @@ jobs:
               sudo apt-get install -y portaudio19-dev
           - os: macos-latest
             platform: macos
+            node_token: darwin
             portaudio: |
               brew install portaudio
           - os: windows-latest
@@ -58,12 +59,15 @@ jobs:
         run: ${{ matrix.portaudio }}
 
       - name: Create virtual environment
+        shell: bash
         run: python -m venv .venv
 
       - name: Install dependencies
+        shell: bash
         run: |
           "$VENV_PY" -m pip install --upgrade pip
           "$VENV_PY" -m pip install -e .
+          "$VENV_PY" -m pip install pyinstaller
 
       - name: Bundle Node runtime
         # Download the official Node distribution and place its binary at
@@ -79,7 +83,7 @@ jobs:
             macos)   node_arch=arm64 ;;
             windows) node_arch=x64  ;;
           esac
-          url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${{ matrix.platform }}-${node_arch}.tar.gz"
+          url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${{ matrix.node_token || matrix.platform }}-${node_arch}.tar.gz"
           echo "Downloading $url"
           ok=0
           for attempt in 1 2 3 4 5; do
@@ -100,12 +104,14 @@ jobs:
           pamt/node/node/bin/node${{ matrix.platform == 'windows' && '.exe' || '' }} --version
 
       - name: Install Clear SDK
+        shell: bash
         run: node setup.js
 
       - name: Verify SDK
         # run.js has no --verify flag; instead confirm the native SDK import
         # (the one clean.js uses) resolves from pamt/node/node_modules. This
         # catches a missing/mis-installed SDK without downloading the model.
+        shell: bash
         working-directory: pamt/node
         run: |
           node -e 'import("@desert-ant-labs/clear/native").then(m => {
