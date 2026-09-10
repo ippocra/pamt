@@ -155,7 +155,9 @@ class PamtApp:
         self._stop_evt = threading.Event()
         self._mic_choice: tuple[int, str] | None = None      # user-picked mic
         self._system_choice: tuple[int, str] | None = None   # user-picked system
-        # Menu items whose text we update as state changes.
+        # Menu items whose labels we update as state changes. pystray
+        # MenuItem objects are immutable, so labels are updated by replacing
+        # the item in the menu (see _set_item_text), not by writing .text.
         self._record_item = None
         self._latest_item = None
 
@@ -399,16 +401,46 @@ class PamtApp:
                 except FileNotFoundError:
                     continue
 
+    def _set_item_text(self, item: "pystray.MenuItem", text: str) -> None:
+        """Update a menu item's label.
+
+        pystray MenuItem objects are immutable (``text`` is a read-only
+        property), so the label is changed by replacing the item with a new
+        one carrying the same action/flags, then redrawing the menu. The
+        tracked reference (``self._record_item`` / ``self._latest_item``) is
+        updated to the new item so subsequent refreshes keep finding it.
+        """
+        if item is None or self._icon is None:
+            return
+        import pystray
+        menu = self._icon.menu
+        if not isinstance(menu, pystray.Menu):
+            return
+        new = pystray.MenuItem(text, item._action,  # noqa: SLF001
+                               checked=None, radio=False,
+                               default=item.default, visible=item.visible)
+        for i, it in enumerate(menu.items):
+            if it is item:
+                items = list(menu.items)
+                items[i] = new
+                menu._items = tuple(items)  # noqa: SLF001
+                break
+        self._icon.update_menu()
+        if self._record_item is item:
+            self._record_item = new
+        if self._latest_item is item:
+            self._latest_item = new
+
     def _refresh_state(self) -> None:
         """Update the live menu labels after a state change (best-effort)."""
         try:
-            import pystray
             if self._record_item is not None and self._icon is not None:
                 if self.recorder.recording:
-                    self._record_item.text = f"⏹ Stop recording  ({_fmt(self.recorder.duration)})"
+                    self._set_item_text(
+                        self._record_item,
+                        f"⏹ Stop recording  ({_fmt(self.recorder.duration)})")
                 else:
-                    self._record_item.text = "⏺ Start recording"
-                self._icon.update_menu()
+                    self._set_item_text(self._record_item, "⏺ Start recording")
             self._refresh_latest_label()
         except Exception:
             log.exception("menu refresh failed")
@@ -417,8 +449,10 @@ class PamtApp:
         if self._latest_item is None:
             return
         latest = _latest_recording(MEETINGS_DIR)
-        self._latest_item.text = (f"Open latest recording  ({latest.name})"
-                                  if latest else "Open latest recording  (none yet)")
+        self._set_item_text(
+            self._latest_item,
+            f"Open latest recording  ({latest.name})" if latest
+            else "Open latest recording  (none yet)")
 
     # -- UI loop ---------------------------------------------------------
 
@@ -503,12 +537,13 @@ class PamtApp:
                 icon.title = (f"PAmt REC {_fmt(rec.duration)}  "
                               f"mic:{lvl_mic} sys:{lvl_sys}")
                 if self._record_item is not None:
-                    self._record_item.text = (
+                    self._set_item_text(
+                        self._record_item,
                         f"⏹ Stop recording  ({_fmt(rec.duration)})")
             else:
                 icon.title = "PAmt - idle (Ctrl+Alt+R to record)"
                 if self._record_item is not None:
-                    self._record_item.text = "⏺ Start recording"
+                    self._set_item_text(self._record_item, "⏺ Start recording")
         except Exception:
             log.exception("tray refresh failed")
 
