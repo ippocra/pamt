@@ -99,17 +99,33 @@ class CleanUnavailable(RuntimeError):
 
 
 def node_binary() -> Optional[str]:
-    """Return the path to a usable ``node`` executable, or None."""
-    # 1) PAmt-owned Node (shipped with the app / installed by setup.js).
-    candidates = [
-        NODE_DIR / "node" / "bin" / "node",          # bundled, per-platform
-        NODE_DIR / ".node" / "bin" / "node",
-    ]
-    for c in candidates:
-        if c.is_file() and os.access(c, os.X_OK):
-            return str(c)
-    # 2) System Node on PATH.
-    return shutil.which("node")
+    """Return the path to a usable ``node`` executable, or None.
+
+    Prefers the node runtime bundled inside the package (``pamt/node/node``)
+    -- the official binaries ship it there and PyInstaller's
+    ``--collect-all pamt`` carries it into the onefile. Falls back to a
+    system ``node`` on PATH. On Windows we must return a real ``.exe``:
+    ``shutil.which("node")`` can return the ``node.cmd`` shim, which
+    ``subprocess.run`` cannot spawn from a PyInstaller onefile.
+    """
+    is_win = os.name == "nt"
+    # 1) Node bundled with PAmt (installed by the CI build or setup).
+    for sub in ("node", ".node"):
+        base = NODE_DIR / sub
+        for candidate in (
+            base / "bin" / "node.exe" if is_win else base / "bin" / "node",
+            base / "bin" / "node",
+            base / "node.exe" if is_win else base / "node",
+        ):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    # 2) System Node on PATH (real binary, not a .cmd shim).
+    which = shutil.which("node.exe" if is_win else "node")
+    if which:
+        return which
+    if is_win:
+        return shutil.which("node")
+    return None
 
 
 def _sdk_ready() -> bool:

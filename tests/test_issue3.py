@@ -583,7 +583,18 @@ class TestPackaging:
     def test_ci_bakes_sdk_into_binary(self):
         wf = (REPO_ROOT / ".github/workflows/build.yml").read_text()
         assert "setup.js" in wf, "CI must install the Clear SDK (node setup.js)"
-        assert "npm ci" in wf
+        # The node runtime must be downloaded and bundled so the binary works
+        # on machines without Node installed.
+        assert "nodejs.org/dist" in wf, "CI must bundle a node runtime"
+        # PyInstaller must collect the whole pamt package (SDK + node binary).
+        assert "--collect-all pamt" in wf
+
+    def test_ci_no_root_npm_ci(self):
+        # Regression: an earlier build.yml ran `npm ci` at the repo root where
+        # no package-lock.json exists, failing every platform. setup.js owns
+        # SDK installation inside pamt/node/.
+        wf = (REPO_ROOT / ".github/workflows/build.yml").read_text()
+        assert "npm ci" not in wf
 
     def test_lockfile_present(self):
         assert (REPO_ROOT / "pamt" / "node" / "package-lock.json").is_file()
