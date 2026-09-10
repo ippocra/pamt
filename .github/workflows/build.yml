@@ -14,18 +14,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        - os: ubuntu-latest
-          platform: linux
-          portaudio: |
-            sudo apt-get update
-            sudo apt-get install -y portaudio19-dev
-        - os: macos-latest
-          platform: macos
-          portaudio: |
-            brew install portaudio
-        - os: windows-latest
-          platform: windows
-          portaudio: ""
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            portaudio: |
+              sudo apt-get update
+              sudo apt-get install -y portaudio19-dev
+          - os: macos-latest
+            platform: macos
+            portaudio: |
+              brew install portaudio
+          - os: windows-latest
+            platform: windows
+            portaudio: ""
 
     runs-on: ${{ matrix.os }}
 
