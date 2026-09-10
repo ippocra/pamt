@@ -27,6 +27,8 @@ jobs:
               brew install portaudio
           - os: windows-latest
             platform: windows
+            node_token: win
+            node_ext: zip
             portaudio: ""
 
     runs-on: ${{ matrix.os }}
@@ -84,11 +86,16 @@ jobs:
             macos)   node_arch=arm64 ;;
             windows) node_arch=x64  ;;
           esac
-          url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${{ matrix.node_token || matrix.platform }}-${node_arch}.tar.gz"
+          # Node dist filenames use "win" (not "windows") and "darwin" (not
+          # "macos"), and Windows ships .zip (not .tar.gz). The matrix
+          # overrides node_token/node_ext where the platform name differs.
+          node_token="${{ matrix.node_token || matrix.platform }}"
+          node_ext="${{ matrix.node_ext || 'tar.gz' }}"
+          url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${node_token}-${node_arch}.${node_ext}"
           echo "Downloading $url"
           ok=0
           for attempt in 1 2 3 4 5; do
-            if curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 30 --max-time 300 "$url" -o /tmp/node.tar.gz; then
+            if curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 30 --max-time 300 "$url" -o /tmp/node-dist; then
               ok=1
               break
             fi
@@ -100,9 +107,20 @@ jobs:
             exit 1
           fi
           mkdir -p pamt/node/node
-          tar -xzf /tmp/node.tar.gz -C pamt/node/node --strip-components=1
-          rm /tmp/node.tar.gz
-          pamt/node/node/bin/node${{ matrix.platform == 'windows' && '.exe' || '' }} --version
+          if [ "$node_ext" = "zip" ]; then
+            (cd pamt/node/node && unzip -qo /tmp/node-dist)
+          else
+            tar -xzf /tmp/node-dist -C pamt/node/node --strip-components=1
+          fi
+          rm /tmp/node-dist
+          # Confirm the runtime is where node_binary() will find it. On
+          # Windows the zip puts node.exe at the top level (pamt/node/node/),
+          # on Linux/macOS the tarball puts it under bin/.
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            pamt/node/node/node.exe --version
+          else
+            pamt/node/node/bin/node --version
+          fi
 
       - name: Install Clear SDK
         shell: bash
