@@ -175,3 +175,35 @@ jobs:
           files: |
             dist/**/*.tar.gz
             dist/**/*.zip
+
+  # Rolling "dev" channel: on every push to main (that isn't a tag), publish
+  # the three platform binaries as a single pre-release named "dev-latest"
+  # that is REPLACED in place each time. This gives a continuously-updated
+  # binary to grab for testing without cutting a real release or polluting
+  # the release history.
+  dev:
+    needs: build
+    if: github.ref == 'refs/heads/main' && !startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish rolling dev pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          name: "dev-latest (main @ ${{ github.sha }})"
+          body: |
+            Rolling build from `main` — always the latest committed code,
+            replaced in place on every push. Not a stable release; grab it
+            to test current changes. Stable releases are tagged `v*`.
+
+            Built from commit `${{ github.sha }}`.
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip

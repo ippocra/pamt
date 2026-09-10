@@ -599,6 +599,23 @@ class TestPackaging:
     def test_lockfile_present(self):
         assert (REPO_ROOT / "pamt" / "node" / "package-lock.json").is_file()
 
+    def test_ci_release_strategy(self):
+        # Stable releases are tag-driven (v*); a rolling "dev" pre-release is
+        # published on every push to main and replaced in place. Parsed as
+        # text so the test needs no yaml dependency.
+        wf = (REPO_ROOT / ".github/workflows/build.yml").read_text()
+        # Tagged stable release job.
+        assert "release:" in wf
+        assert "startsWith(github.ref, 'refs/tags/v')" in wf
+        # Rolling dev pre-release job on main (non-tag).
+        assert "dev:" in wf
+        assert "refs/heads/main" in wf
+        # It publishes a fixed-tag pre-release that is not made "latest", so
+        # each push replaces the same dev-latest release in place.
+        assert "tag_name: dev-latest" in wf
+        assert "prerelease: true" in wf
+        assert "make_latest: false" in wf
+
 
 if __name__ == "__main__":
     _install_pyaudio_stub()
