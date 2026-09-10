@@ -34,6 +34,9 @@ jobs:
       # Node version used both by CI (setup-node) and by the runtime that we
       # bundle into the binary. Keep in sync with the Clear SDK's requirements.
       NODE_VERSION: "22.17.0"
+      # All steps that need the venv use its python directly (no `source
+      # activate`), which is the same on Linux/macOS and Windows Git Bash.
+      VENV_PY: .venv/bin/python
 
     steps:
       - name: Check out repository
@@ -59,19 +62,18 @@ jobs:
 
       - name: Install dependencies
         run: |
-          source .venv/bin/activate 2>/dev/null || .venv\Scripts\activate
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-        shell: bash
+          "$VENV_PY" -m pip install --upgrade pip
+          "$VENV_PY" -m pip install -e .
 
       - name: Bundle Node runtime
         # Download the official Node distribution and place its binary at
         # pamt/node/node/bin/node[.exe] so the app works on machines without
         # Node installed. PyInstaller's --collect-all pamt carries it into
-        # the onefile.
+        # the onefile. nodejs.org is occasionally flaky from CI (curl exit
+        # 56), so we retry a few times with backoff before giving up.
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           case "${{ matrix.platform }}" in
             linux)   node_arch=x64  ;;
             macos)   node_arch=arm64 ;;
@@ -79,7 +81,19 @@ jobs:
           esac
           url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${{ matrix.platform }}-${node_arch}.tar.gz"
           echo "Downloading $url"
-          curl -fsSL "$url" -o /tmp/node.tar.gz
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 30 --max-time 300 "$url" -o /tmp/node.tar.gz; then
+              ok=1
+              break
+            fi
+            echo "Download attempt $attempt failed, retrying in 10s..." >&2
+            sleep 10
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "FATAL: could not download node runtime after retries: $url"
+            exit 1
+          fi
           mkdir -p pamt/node/node
           tar -xzf /tmp/node.tar.gz -C pamt/node/node --strip-components=1
           rm /tmp/node.tar.gz
@@ -89,12 +103,19 @@ jobs:
         run: node setup.js
 
       - name: Verify SDK
-        run: node pamt/node/run.js --verify
+        # run.js has no --verify flag; instead confirm the native SDK import
+        # (the one clean.js uses) resolves from pamt/node/node_modules. This
+        # catches a missing/mis-installed SDK without downloading the model.
+        working-directory: pamt/node
+        run: |
+          node -e 'import("@desert-ant-labs/clear/native").then(m => {
+            if (!m.Clear || typeof m.Clear.load !== "function") throw new Error("Clear.load missing");
+            console.log("Clear SDK resolves OK (native build)");
+          }).catch(e => { console.error("SDK import failed:", e.message); process.exit(1); })'
 
       - name: Build with PyInstaller
         run: |
-          source .venv/bin/activate 2>/dev/null || .venv\Scripts\activate
-          pyinstaller --name pamt \
+          "$VENV_PY" -m PyInstaller --name pamt \
             --onefile \
             --clean \
             --collect-all pamt \
@@ -107,8 +128,7 @@ jobs:
         # node child-process path end-to-end by invoking the clean module
         # directly with the same lookup logic the binary uses.
         run: |
-          source .venv/bin/activate 2>/dev/null || .venv\Scripts\activate
-          python -c "
+          "$VENV_PY" -c "
           from pamt import clean
           node = clean.node_binary()
           assert node, 'node_binary() returned None -- bundled node not found'
