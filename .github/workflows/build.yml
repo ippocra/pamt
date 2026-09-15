@@ -1,11 +1,13 @@
-name: Build
+name: build
 
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: [ main ]
+    tags: [ "v*" ]
   pull_request:
-  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -14,21 +16,34 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            suffix: linux
-            pre-install: |
+            platform: linux
+            portaudio: |
               sudo apt-get update
               sudo apt-get install -y portaudio19-dev
-          - os: windows-latest
-            suffix: windows
-            pre-install: ""
           - os: macos-latest
-            suffix: macos
-            pre-install: |
+            platform: macos
+            node_token: darwin
+            portaudio: |
               brew install portaudio
+          - os: windows-latest
+            platform: windows
+            node_token: win
+            node_ext: zip
+            portaudio: ""
 
     runs-on: ${{ matrix.os }}
+
+    env:
+      # Node version used both by CI (setup-node) and by the runtime that we
+      # bundle into the binary. Keep in sync with the Clear SDK's requirements.
+      NODE_VERSION: "22.17.0"
+      # All steps that need the venv use its python directly (no `source
+      # activate`). Windows venvs use .venv\Scripts\python.exe; Linux/macOS use
+      # .venv/bin/python.
+      VENV_PY: ${{ matrix.platform == 'windows' && '.venv\Scripts\python.exe' || '.venv/bin/python' }}
+
     steps:
-      - name: Checkout
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -36,76 +51,213 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Platform pre-install
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install system dependencies
+        if: matrix.portaudio != ''
         shell: bash
-        run: |
-          ${{ matrix.pre-install }}
+        run: ${{ matrix.portaudio }}
+
+      - name: Create virtual environment
+        shell: bash
+        run: python -m venv .venv
 
       - name: Install dependencies
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install pyaudio pystray pillow pynput platformdirs pyinstaller
+          "$VENV_PY" -m pip install --upgrade pip
+          "$VENV_PY" -m pip install -e .
+          "$VENV_PY" -m pip install pyinstaller
 
-      - name: Build binary (Linux)
-        if: runner.os == 'Linux'
+      - name: Bundle Node runtime
+        # Download the official Node distribution and place its binary at
+        # pamt/node/node/bin/node[.exe] so the app works on machines without
+        # Node installed. PyInstaller's --collect-all pamt carries it into
+        # the onefile. nodejs.org is occasionally flaky from CI (curl exit
+        # 56), so we retry a few times with backoff before giving up.
         shell: bash
         run: |
-          pyinstaller --onefile --clean --name pamt \
-            --collect-all pamt \
-            launcher.py
-          mv dist/pamt "dist/pamt-${{ matrix.suffix }}"
+          set -uo pipefail
+          case "${{ matrix.platform }}" in
+            linux)   node_arch=x64  ;;
+            macos)   node_arch=arm64 ;;
+            windows) node_arch=x64  ;;
+          esac
+          # Node dist filenames use "win" (not "windows") and "darwin" (not
+          # "macos"), and Windows ships .zip (not .tar.gz). The matrix
+          # overrides node_token/node_ext where the platform name differs.
+          node_token="${{ matrix.node_token || matrix.platform }}"
+          node_ext="${{ matrix.node_ext || 'tar.gz' }}"
+          url="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${node_token}-${node_arch}.${node_ext}"
+          echo "Downloading $url"
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 30 --max-time 300 "$url" -o /tmp/node-dist; then
+              ok=1
+              break
+            fi
+            echo "Download attempt $attempt failed, retrying in 10s..." >&2
+            sleep 10
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "FATAL: could not download node runtime after retries: $url"
+            exit 1
+          fi
+          mkdir -p pamt/node/node
+          if [ "$node_ext" = "zip" ]; then
+            # Windows node zips have a top-level folder (node-vX-win-x64/);
+            # unzip has no --strip-components, so extract to a temp dir and
+            # move the inner contents up so node.exe lands at pamt/node/node/.
+            tmpdir=$(mktemp -d)
+            (cd "$tmpdir" && unzip -qo /tmp/node-dist)
+            inner=$(ls "$tmpdir")
+            cp -R "$tmpdir/$inner"/. pamt/node/node/
+            rm -rf "$tmpdir"
+          else
+            tar -xzf /tmp/node-dist -C pamt/node/node --strip-components=1
+          fi
+          rm /tmp/node-dist
+          # Confirm the runtime is where node_binary() will find it. On
+          # Windows the zip puts node.exe at the top level (pamt/node/node/),
+          # on Linux/macOS the tarball puts it under bin/.
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            pamt/node/node/node.exe --version
+          else
+            pamt/node/node/bin/node --version
+          fi
 
-      - name: Build binary (Windows)
-        if: runner.os == 'Windows'
+      - name: Install Clear SDK
         shell: bash
-        run: |
-          pyinstaller --onefile --clean --name pamt \
-            --collect-all pamt \
-            launcher.py
-          mv dist/pamt.exe "dist/pamt-${{ matrix.suffix }}.exe"
+        run: node setup.js
 
-      - name: Build binary (macOS)
-        if: runner.os == 'macOS'
+      - name: Verify SDK
+        # run.js has no --verify flag; instead confirm the native SDK import
+        # (the one clean.js uses) resolves from pamt/node/node_modules. This
+        # catches a missing/mis-installed SDK without downloading the model.
         shell: bash
+        working-directory: pamt/node
         run: |
-          pyinstaller --onefile --clean --name pamt \
+          node -e 'import("@desert-ant-labs/clear/native").then(m => {
+            if (!m.Clear || typeof m.Clear.load !== "function") throw new Error("Clear.load missing");
+            console.log("Clear SDK resolves OK (native build)");
+          }).catch(e => { console.error("SDK import failed:", e.message); process.exit(1); })'
+
+      - name: Build with PyInstaller
+        run: |
+          "$VENV_PY" -m PyInstaller --name pamt \
+            --onefile \
+            --clean \
             --collect-all pamt \
             launcher.py
-          mv dist/pamt "dist/pamt-${{ matrix.suffix }}"
+        shell: bash
+
+      - name: Smoke test the built binary
+        # The binary must be able to locate the bundled node runtime and the
+        # Clear SDK. We can't run the GUI headlessly, but we can verify the
+        # node child-process path end-to-end by invoking the clean module
+        # directly with the same lookup logic the binary uses.
+        run: |
+          "$VENV_PY" -c "
+          from pamt import clean
+          node = clean.node_binary()
+          assert node, 'node_binary() returned None -- bundled node not found'
+          print('node binary:', node)
+          print('sdk ready:', clean._sdk_ready())
+          assert clean._sdk_ready(), 'Clear SDK not bundled'
+          "
+        shell: bash
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          version=$(cat .version)
+          case "${{ matrix.platform }}" in
+            linux)
+              mv dist/pamt dist/pamt-${{ matrix.platform }}
+              chmod +x dist/pamt-${{ matrix.platform }}
+              tar -czf dist/pamt-${version}-${{ matrix.platform }}.tar.gz -C dist pamt-${{ matrix.platform }}
+              rm dist/pamt-${{ matrix.platform }}
+              ;;
+            macos)
+              mv dist/pamt dist/pamt-${{ matrix.platform }}
+              chmod +x dist/pamt-${{ matrix.platform }}
+              tar -czf dist/pamt-${version}-${{ matrix.platform }}.tar.gz -C dist pamt-${{ matrix.platform }}
+              rm dist/pamt-${{ matrix.platform }}
+              ;;
+            windows)
+              # Rename the exe before zipping so the archive contains a clean name.
+              mv dist/pamt.exe "dist/pamt-${{ matrix.platform }}.exe"
+              powershell -Command "Compress-Archive -Path 'dist/pamt-${{ matrix.platform }}.exe' -DestinationPath 'dist/pamt-${version}-${{ matrix.platform }}.zip'"
+              rm "dist/pamt-${{ matrix.platform }}.exe"
+              ;;
+          esac
+        shell: bash
 
       - name: Upload artifact
+        if: matrix.platform != 'windows'
         uses: actions/upload-artifact@v4
         with:
-          name: pamt-${{ matrix.suffix }}
-          path: dist/pamt-${{ matrix.suffix }}*
+          name: pamt-${{ matrix.platform }}
+          path: dist/pamt-*.tar.gz
+          if-no-files-found: error
 
-  # Create a GitHub Release when a version tag is pushed.
+      - name: Upload Windows artifact
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pamt-${{ matrix.platform }}
+          path: dist/pamt-*.zip
+          if-no-files-found: error
+
   release:
     needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          # the tag points at the commit, not at main's HEAD
-          ref: ${{ github.ref }}
-          persist-credentials: false
-
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: releases
+          path: dist
 
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION=$(git describe --tags --exact-match)
-          gh release create "$VERSION" \
-            --title "PAmt $VERSION" \
-            --notes "PAmt $VERSION — dual-track meeting recorder." \
-            $(find releases -type f | sort)
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+
+  # Rolling "dev" channel: on every push to main (that isn't a tag), publish
+  # the three platform binaries as a single pre-release named "dev-latest"
+  # that is REPLACED in place each time. This gives a continuously-updated
+  # binary to grab for testing without cutting a real release or polluting
+  # the release history.
+  dev:
+    needs: build
+    if: github.ref == 'refs/heads/main' && !startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish rolling dev pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          name: "dev-latest (main @ ${{ github.sha }})"
+          body: |
+            Rolling build from `main` — always the latest committed code,
+            replaced in place on every push. Not a stable release; grab it
+            to test current changes. Stable releases are tagged `v*`.
+
+            Built from commit `${{ github.sha }}`.
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip

@@ -38,7 +38,22 @@ if (!existsSync(pkgJson)) {
 }
 
 console.log(`Installing Clear SDK into ${nodeDir} ...`);
-execFileSync("npm", ["install", "--no-audit", "--no-fund"],
+// Invoke npm through Node's own CLI instead of spawning the bare "npm" name:
+// on Windows under Git Bash, `npm` is a .cmd shim that spawnSync cannot
+// resolve (ENOENT). Standard node distributions ship npm's JS CLI next to
+// the node binary (<prefix>/lib/node_modules/npm/bin/npm-cli.js).
+const npmCli = (() => {
+  // Standard node distributions ship npm's JS CLI at
+  // <prefix>/lib/node_modules/npm/bin/npm-cli.js, i.e. two levels up from
+  // the node binary.
+  const candidates = [
+    path.join(path.dirname(path.dirname(process.execPath)), "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+    path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
+  for (const c of candidates) if (existsSync(c)) return c;
+  throw new Error("cannot locate npm CLI next to node at " + process.execPath);
+})();
+execFileSync(process.execPath, [npmCli, "install", "--no-audit", "--no-fund"],
   { stdio: "inherit", cwd: nodeDir });
 
 // Smoke test: resolve the SDK module (no audio, no model load).

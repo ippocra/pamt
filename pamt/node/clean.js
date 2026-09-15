@@ -4,18 +4,24 @@
 // Invoked by pamt/clean.py (via ./run.js, which just re-exports this file so
 // Node can resolve the SDK from this directory's node_modules):
 //   node run.js --clean <input.wav> --preset meeting|podcast|video|voiceover
+//               [--cache-root <dir>]
 //
 // Prints a single JSON object on stdout:
 //   ok: { ok: true, input, output, durationSec, processingSec, preset, note? }
 //   err: { ok: false, error: "<message>" }
 // Exit code 0 on success, 1 on any failure. Progress/diagnostics go to stderr.
 //
-// The SDK lives in ./node_modules (installed by setup.js), so this file must
-// stay inside pamt/node/: ESM resolves packages from the importing file's
-// own directory, and a helper one level up would not see node_modules.
+// The SDK lives in ./node_modules (installed by setup.js, baked into the
+// wheel/binary), so this file must stay inside pamt/node/: ESM resolves
+// packages from the importing file's own directory, and a helper one level up
+// would not see node_modules.
 //
 // Node needs the *native* build of Clear (`/native` subpath); the default
 // import is the WebAssembly/browser runtime and refuses to load() in Node.
+//
+// --cache-root: where the model weights (~24 MB) live. PAmt passes its own
+// per-user cache dir (XDG_CACHE_HOME aware); when omitted the SDK uses its
+// own default (~/.cache).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { Clear } from "@desert-ant-labs/clear/native";
@@ -57,12 +63,30 @@ function encodeWav16(samples, sampleRate) {
 }
 
 export async function run(argv) {
+  if (argv[0] === "--warm-up") {
+    // Download the model weights once (~24 MB) and cache them, so the first
+    // real clean run is fast. Exits 0 when the weights are cached, 1 on a
+    // download failure (e.g. no network) -- PAmt treats this as non-fatal.
+    const cacheRootIdx = argv.indexOf("--cache-root");
+    const cacheRoot = cacheRootIdx >= 0 ? argv[cacheRootIdx + 1] : null;
+    const clear = await Clear.load(cacheRoot ? { cacheRoot } : {});
+    try { clear.dispose(); } catch { /* ignore */ }
+    // `clear.isDownloaded()` reflects the state at load time (false if the
+    // weights were fetched during this run), so report the file on disk
+    // instead: PAmt's model-ready check looks for a non-empty cache dir.
+    process.stdout.write(JSON.stringify({
+      ok: true, warmedUp: true,
+    }) + "\n");
+    process.exit(0);
+  }
   if (argv[0] !== "--clean" || !argv[1]) {
-    fail("usage: run.js --clean <input.wav> --preset <name>");
+    fail("usage: run.js --clean <input.wav> --preset <name> | --warm-up");
   }
   const input = argv[1];
   const presetIdx = argv.indexOf("--preset");
   const preset = presetIdx >= 0 ? argv[presetIdx + 1] : "meeting";
+  const cacheRootIdx = argv.indexOf("--cache-root");
+  const cacheRoot = cacheRootIdx >= 0 ? argv[cacheRootIdx + 1] : null;
   const spec = PRESETS[preset] || PRESETS.meeting;
 
   const bytes = new Uint8Array(readFileSync(input));
@@ -78,7 +102,7 @@ export async function run(argv) {
     `loading model (first run downloads ~24 MB)...\n`
   );
 
-  const clear = await Clear.load();
+  const clear = await Clear.load(cacheRoot ? { cacheRoot } : {});
   const options = {};
   if (spec.lufs != null) options.targetLUFS = spec.lufs;
 

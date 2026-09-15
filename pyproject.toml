@@ -28,7 +28,16 @@ version = { file = ".version" }
 include = ["pamt*"]
 
 [tool.setuptools.package-data]
-pamt = ["assets/*.png", "assets/*.svg", "node/clean.js", "node/run.js"]
+pamt = [
+    "assets/*.png",
+    "assets/*.svg",
+    "node/clean.js",
+    "node/run.js",
+    "node/package.json",
+    # Clear SDK (installed by `node setup.js`); shipped in the wheel/binary
+    # so clean audio works out of the box.
+    "node/node_modules/**/*",
+]
 
 [project.scripts]
 pamt = "pamt.app:main"
